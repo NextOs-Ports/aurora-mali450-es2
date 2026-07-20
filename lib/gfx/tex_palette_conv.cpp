@@ -13,6 +13,7 @@
 #include "../gl/textures.hpp"
 #include "render_worker.hpp"
 
+#include <algorithm>
 #include <string>
 
 namespace aurora::gfx::tex_palette_conv {
@@ -50,10 +51,11 @@ constexpr char kFragDirect[] = R"(#version 100
 precision highp float;
 uniform sampler2D src;
 uniform sampler2D tlut;
+uniform vec4 tlut_params;
 varying vec2 v_uv;
 void main() {
   float index = floor(texture2D(src, v_uv).r * 255.0 + 0.5);
-  gl_FragColor = texture2D(tlut, vec2((index + 0.5) / 256.0, 0.5));
+  gl_FragColor = texture2D(tlut, vec2((index + 0.5) * tlut_params.x, 0.5));
 }
 )";
 
@@ -61,10 +63,11 @@ constexpr char kFragFromFloat8[] = R"(#version 100
 precision highp float;
 uniform sampler2D src;
 uniform sampler2D tlut;
+uniform vec4 tlut_params;
 varying vec2 v_uv;
 void main() {
   float index = floor(texture2D(src, v_uv).r * 255.0 + 0.5);
-  gl_FragColor = texture2D(tlut, vec2((index + 0.5) / 256.0, 0.5));
+  gl_FragColor = texture2D(tlut, vec2((index + 0.5) * tlut_params.x, 0.5));
 }
 )";
 
@@ -72,10 +75,11 @@ constexpr char kFragFromFloat4[] = R"(#version 100
 precision highp float;
 uniform sampler2D src;
 uniform sampler2D tlut;
+uniform vec4 tlut_params;
 varying vec2 v_uv;
 void main() {
   float index = floor(texture2D(src, v_uv).r * 15.0 + 0.5);
-  gl_FragColor = texture2D(tlut, vec2((index + 0.5) / 16.0, 0.5));
+  gl_FragColor = texture2D(tlut, vec2((index + 0.5) * tlut_params.x, 0.5));
 }
 )";
 #else
@@ -228,6 +232,18 @@ void run(const ConvRequest& req) {
   gl::set_viewport_gl(0, 0, static_cast<gl::GLsizei>(req.dst->size.width),
                       static_cast<gl::GLsizei>(req.dst->size.height), 0.f, 1.f);
   gl::use_program(pipeline.program);
+#ifdef AURORA_GLES2
+  // GLSL ES 1.00 has no textureSize(). Palette widths are not always powers of
+  // two: Twilight Princess' gameplay minimap has 204 TLUT entries, for example.
+  // Sampling it with the old hard-coded 1/256 coordinate shifted every lookup
+  // into the wrong texel and produced the solid black minimap rectangle.
+  const gl::GLint tlutParamsLoc = gl::gl.GetUniformLocation(pipeline.program, "tlut_params");
+  if (tlutParamsLoc >= 0) {
+    const gl::GLfloat tlutParams[4]{
+        1.f / static_cast<gl::GLfloat>(std::max(1u, req.tlut->size.width)), 0.f, 0.f, 0.f};
+    gl::gl.Uniform4fv(tlutParamsLoc, 1, tlutParams);
+  }
+#endif
   gl::apply_baked_state(pipeline.state);
   gl::bind_texture_unit(0, req.src->sampleTextureView.id, g_sampler.id);
   gl::bind_texture_unit(1, req.tlut->sampleTextureView.id, g_sampler.id);
