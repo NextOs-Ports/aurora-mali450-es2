@@ -198,7 +198,8 @@ void makeFstRecursive(IterateNode& node, FstIndex parent) {
     return;
   }
 
-  std::ranges::sort(node.children, [](const auto& a, const auto& b) { return a->name < b->name; });
+  std::sort(node.children.begin(), node.children.end(),
+            [](const auto& a, const auto& b) { return a->name < b->name; });
 
   const FstIndex ourIndex = static_cast<FstIndex>(s_fstEntries.size());
   s_fstEntries.emplace_back(node.name, true, parent, 0, node.overlayData, node.isOverlay, node.originalEntryNum);

@@ -222,7 +222,11 @@ if (AURORA_ENABLE_GX)
     # points directly (only core ES3 calls; the desktop-only glPolygonMode/DrawElementsBaseVertex/
     # ClipControl are #if-gated out), resolved from libGLESv2 -- libmali on device, Mesa on the
     # dev box. Linking libGLESv2 is exactly what every normal SDL+GLES app does (Normalcy rule 7).
-    target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
+    if (AURORA_GLES2)
+      target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES2)
+    else ()
+      target_compile_definitions(imgui_backends PRIVATE IMGUI_IMPL_OPENGL_ES3)
+    endif ()
     find_library(AURORA_GLESV2_LIB GLESv2)
     if (NOT AURORA_GLESV2_LIB)
       set(AURORA_GLESV2_LIB GLESv2) # fall back to the linker's own -lGLESv2 search

@@ -7,6 +7,8 @@
 #include "../gl/census.hpp"
 #include "../gl/context.hpp"
 #include "../gl/fbo_cache.hpp"
+#include "../gl/pass.hpp"
+#include "../gl/program.hpp"
 #include "../gl/state.hpp"
 #include "../gl/textures.hpp"
 #include "../webgpu/gpu.hpp"
@@ -32,11 +34,11 @@
 #include <deque>
 #include <mutex>
 #include <optional>
-#include <ranges>
 #include <string>
 #include <thread>
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/base/casts.h>
 #include <magic_enum.hpp>
 
 #include "tracy/Tracy.hpp"
@@ -1575,8 +1577,8 @@ void end_frame(EndFrameCallback callback) {
 
 #if defined(AURORA_GFX_DEBUG_GROUPS)
   if (!g_debugGroupStack.empty()) {
-    for (auto& it : std::ranges::reverse_view(g_debugGroupStack)) {
-      Log.warn("Debug group was not popped at end of frame: {}", it);
+    for (auto it = g_debugGroupStack.rbegin(); it != g_debugGroupStack.rend(); ++it) {
+      Log.warn("Debug group was not popped at end of frame: {}", *it);
     }
     g_debugGroupStack.clear();
   }
@@ -1702,6 +1704,74 @@ static void blit_texture_region(const gl::Texture& src, gl::Origin3D srcOrigin, 
   if (src.id == 0 || dst.id == 0 || size.width == 0 || size.height == 0) {
     return;
   }
+#ifdef AURORA_GLES2
+  static gl::GLuint copyProgram = 0;
+  static gl::GLint uvLocation = -1;
+  if (copyProgram == 0) {
+    constexpr char vs[] = R"(#version 100
+precision highp float;
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+uniform vec4 u_uv[2];
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  vec2 base_uv = vec2(a_uv.x, mix(1.0 - a_uv.y, a_uv.y, u_uv[1].x));
+  v_uv = u_uv[0].xy + base_uv * u_uv[0].zw;
+}
+)";
+    constexpr char fs[] = R"(#version 100
+precision highp float;
+uniform sampler2D src_tex;
+varying vec2 v_uv;
+void main() { gl_FragColor = texture2D(src_tex, v_uv); }
+)";
+    copyProgram = gl::compile_program(vs, fs, "GLES2 texture region copy");
+    if (copyProgram != 0) {
+      gl::gl.UseProgram(copyProgram);
+      uvLocation = gl::gl.GetUniformLocation(copyProgram, "u_uv");
+      const auto samplerLocation = gl::gl.GetUniformLocation(copyProgram, "src_tex");
+      if (samplerLocation >= 0) {
+        gl::gl.Uniform1i(samplerLocation, 0);
+      }
+      gl::gl.UseProgram(0);
+    }
+  }
+  if (copyProgram == 0) {
+    return;
+  }
+  const gl::GLuint drawFbo = gl::get_framebuffer(dst);
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, drawFbo);
+  gl::gl.Disable(gl::GL_SCISSOR_TEST);
+  gl::gl.Viewport(static_cast<gl::GLint>(dstOrigin.x), static_cast<gl::GLint>(dstOrigin.y),
+                  static_cast<gl::GLsizei>(size.width), static_cast<gl::GLsizei>(size.height));
+  gl::gl.UseProgram(copyProgram);
+  gl::gl.ActiveTexture(gl::GL_TEXTURE0);
+  gl::gl.BindTexture(gl::GL_TEXTURE_2D, src.id);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_NEAREST);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_NEAREST);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_S, gl::GL_CLAMP_TO_EDGE);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_T, gl::GL_CLAMP_TO_EDGE);
+  const float invWidth = 1.f / static_cast<float>(src.size.width);
+  const float invHeight = 1.f / static_cast<float>(src.size.height);
+  const float yOrigin = flipY ? static_cast<float>(src.size.height - srcOrigin.y - size.height)
+                              : static_cast<float>(srcOrigin.y);
+  const gl::GLfloat uv[8]{static_cast<float>(srcOrigin.x) * invWidth,
+                          yOrigin * invHeight,
+                          static_cast<float>(size.width) * invWidth,
+                          static_cast<float>(size.height) * invHeight,
+                          flipY ? 1.f : 0.f,
+                          0.f,
+                          0.f,
+                          0.f};
+  if (uvLocation >= 0) {
+    gl::gl.Uniform4fv(uvLocation, 2, uv);
+  }
+  gl::bind_fullscreen_triangle();
+  gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
+  gl::gl.Enable(gl::GL_SCISSOR_TEST);
+  gl::reset_state_cache();
+#else
   const gl::GLuint readFbo = gl::get_framebuffer(src);
   const gl::GLuint drawFbo = gl::get_framebuffer(dst);
   gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
@@ -1728,6 +1798,7 @@ static void blit_texture_region(const gl::Texture& src, gl::Origin3D srcOrigin, 
                          gl::GL_NEAREST);
   gl::gl.Enable(gl::GL_SCISSOR_TEST);
   gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, drawFbo);
+#endif
 }
 
 static void encode_op(FramePacket& frame, const FrameOp& op) {
@@ -1781,14 +1852,33 @@ static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex)
   // scissor, so disable the scissor test and force full write masks around the clears, then
   // re-enable scissor for the draws.
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
+#ifdef AURORA_GLES2
+  gl::GLbitfield clearMask = 0;
+#endif
   if (passInfo.clearColor) {
     gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+#ifdef AURORA_GLES2
+    gl::gl.ClearColor(passInfo.clearColorValue.x(), passInfo.clearColorValue.y(), passInfo.clearColorValue.z(),
+                      passInfo.clearColorValue.w());
+    clearMask |= gl::GL_COLOR_BUFFER_BIT;
+#else
     const gl::GLfloat clearColor[4]{passInfo.clearColorValue.x(), passInfo.clearColorValue.y(),
                                     passInfo.clearColorValue.z(), passInfo.clearColorValue.w()};
     gl::gl.ClearBufferfv(gl::GL_COLOR, 0, clearColor);
+#endif
   }
   if (hasDepth && passInfo.clearDepth) {
     gl::gl.DepthMask(gl::GL_TRUE);
+#ifdef AURORA_GLES2
+    gl::gl.ClearDepthf(passInfo.clearDepthValue);
+    clearMask |= gl::GL_DEPTH_BUFFER_BIT;
+    if (passInfo.hasStencil) {
+      gl::gl.StencilMaskSeparate(gl::GL_FRONT, 0xFFu);
+      gl::gl.StencilMaskSeparate(gl::GL_BACK, 0xFFu);
+      gl::gl.ClearStencil(static_cast<gl::GLint>(passInfo.stencilClearValue));
+      clearMask |= gl::GL_STENCIL_BUFFER_BIT;
+    }
+#else
     if (passInfo.hasStencil) {
       gl::gl.ClearBufferfi(gl::GL_DEPTH_STENCIL, 0, passInfo.clearDepthValue,
                            static_cast<gl::GLint>(passInfo.stencilClearValue));
@@ -1796,7 +1886,13 @@ static void render(FramePacket& frame, RenderPass& passInfo, uint32_t passIndex)
       const gl::GLfloat clearDepth = passInfo.clearDepthValue;
       gl::gl.ClearBufferfv(gl::GL_DEPTH, 0, &clearDepth);
     }
+#endif
   }
+#ifdef AURORA_GLES2
+  if (clearMask != 0) {
+    gl::gl.Clear(clearMask);
+  }
+#endif
   gl::gl.Enable(gl::GL_SCISSOR_TEST);
 
   // The raw clears desynced color/depth mask + scissor from the state-cache shadow; reset it
@@ -2255,8 +2351,8 @@ gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor) {
           static_cast<uint32_t>(descriptor.addressW) << 16 | static_cast<uint32_t>(descriptor.magFilter) << 24,
       static_cast<uint32_t>(descriptor.minFilter) | static_cast<uint32_t>(descriptor.mipmapFilter) << 8 |
           static_cast<uint32_t>(descriptor.maxAnisotropy) << 16,
-      std::bit_cast<uint32_t>(descriptor.lodMinClamp),
-      std::bit_cast<uint32_t>(descriptor.lodMaxClamp),
+      absl::bit_cast<uint32_t>(descriptor.lodMinClamp),
+      absl::bit_cast<uint32_t>(descriptor.lodMaxClamp),
   };
   const auto id = xxh3_hash_s(key, sizeof(key));
   {

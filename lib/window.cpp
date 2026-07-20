@@ -300,6 +300,24 @@ bool create_window(AuroraBackend backend) {
   // The GL backend renders through a real SDL GL context (desktop: SDL_GL_CreateContext;
   // device: the shim's borrowed EGL context), so the window must be an OpenGL window.
   if (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES) {
+#ifdef AURORA_GLES2
+    // SDL selects the EGLConfig while creating the OpenGL window, before
+    // gl::create_desktop gets a chance to set context attributes.  The Mali
+    // fbdev driver's default config has no alpha channel; on Amlogic the OSD
+    // compositor consumes fb0's per-pixel alpha, so an RGB-correct frame from
+    // an RGBX surface scans out as transparent/black.  Request RGBA8 here,
+    // while the choice can still affect the window surface.
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_ALPHA_SIZE, 8);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+#endif
     flags |= SDL_WINDOW_OPENGL;
   }
 #endif

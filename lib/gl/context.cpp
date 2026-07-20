@@ -4,9 +4,21 @@
 
 #include <SDL3/SDL_video.h>
 
+#include <cstring>
+
 namespace aurora::gl {
 namespace {
 Module Log("aurora::gl");
+
+#ifdef AURORA_GLES2
+constexpr int kClientMajor = 2;
+constexpr int kClientMinor = 0;
+constexpr EGLint kRenderableBit = EGL_OPENGL_ES2_BIT;
+#else
+constexpr int kClientMajor = 3;
+constexpr int kClientMinor = 0;
+constexpr EGLint kRenderableBit = EGL_OPENGL_ES3_BIT;
+#endif
 
 ContextMode g_mode = ContextMode::Desktop;
 
@@ -38,11 +50,11 @@ bool create_desktop(const ContextConfig& cfg) {
     Log.error("[gl] desktop context: no SDL window");
     return false;
   }
-  // ES 3.0, offscreen rendering (we never draw to the window's own buffers --
+  // Offscreen rendering (we never draw to the window's own buffers --
   // present is an explicit blit), so no depth/stencil on the default framebuffer.
   SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, kClientMajor);
+  SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, kClientMinor);
   SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
   SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
   SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
@@ -56,14 +68,23 @@ bool create_desktop(const ContextConfig& cfg) {
   SDL_GL_SetSwapInterval(0);
 
   // A second context sharing objects with the render context, for the compiler
-  // thread. SDL makes a freshly created context current, so restore render after.
-  SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
-  g_shareCtx = SDL_GL_CreateContext(g_window);
-  if (g_shareCtx == nullptr) {
-    // Non-fatal: the pipeline cache falls back to threadless (compile on worker).
-    Log.warn("[gl] SDL_GL_CreateContext (share) failed: {}; compiler thread disabled", SDL_GetError());
+  // thread. The NextOS Mali/fbdev driver can create a second context but cannot
+  // move it to another thread, so advertising it as usable makes the compiler
+  // thread issue GL with no current context. Compile inline on the render worker
+  // on that driver; other SDL drivers retain the parallel compiler context.
+  const char* videoDriver = SDL_GetCurrentVideoDriver();
+  if (videoDriver != nullptr && std::strcmp(videoDriver, "mali") == 0) {
+    Log.info("[gl] Mali/fbdev: pipeline compiler uses the render context (threadless)");
+  } else {
+    // SDL makes a freshly created context current, so restore render after.
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    g_shareCtx = SDL_GL_CreateContext(g_window);
+    if (g_shareCtx == nullptr) {
+      // Non-fatal: the pipeline cache falls back to threadless (compile on worker).
+      Log.warn("[gl] SDL_GL_CreateContext (share) failed: {}; compiler thread disabled", SDL_GetError());
+    }
+    SDL_GL_MakeCurrent(g_window, g_renderCtx);
   }
-  SDL_GL_MakeCurrent(g_window, g_renderCtx);
 
   if (!load(desktop_get_proc)) {
     return false;
@@ -74,8 +95,7 @@ bool create_desktop(const ContextConfig& cfg) {
   return true;
 }
 
-// Choose a pbuffer-capable, ES3-renderable RGBA8 config for the dummy surfaces. Tries the
-// ES3 renderable bit first, then ES2 (some drivers advertise ES3 only via the ES2 bit).
+// Choose a pbuffer-capable RGBA8 config for the dummy surfaces.
 bool choose_pbuffer_config(EGLDisplay display, EGLConfig& out) {
   const auto tryChoose = [&](EGLint renderableBit) {
     const EGLint attribs[] = {
@@ -89,7 +109,7 @@ bool choose_pbuffer_config(EGLDisplay display, EGLConfig& out) {
                ? (out = config, true)
                : false;
   };
-  return tryChoose(EGL_OPENGL_ES3_BIT) || tryChoose(EGL_OPENGL_ES2_BIT);
+  return tryChoose(kRenderableBit);
 }
 
 // Create a 1x1 pbuffer for a context's dummy current-surface. Returns EGL_NO_SURFACE on failure;
@@ -120,11 +140,11 @@ bool create_device(const ContextConfig& cfg) {
   }
 
   if (!choose_pbuffer_config(g_eglDisplay, g_eglConfig)) {
-    Log.error("[gl] sdl2-shim context: no pbuffer/ES3 EGLConfig (eglChooseConfig failed)");
+    Log.error("[gl] sdl2-shim context: no pbuffer/ES{} EGLConfig (eglChooseConfig failed)", kClientMajor);
     return false;
   }
 
-  const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE};
+  const EGLint ctxAttribs[] = {EGL_CONTEXT_CLIENT_VERSION, kClientMajor, EGL_NONE};
   // Share with the shim's context so the shim, worker and compiler are one share group.
   g_eglRenderCtx = gl.eglCreateContext(g_eglDisplay, g_eglConfig, cfg.shareEglContext, ctxAttribs);
   if (g_eglRenderCtx == nullptr) {

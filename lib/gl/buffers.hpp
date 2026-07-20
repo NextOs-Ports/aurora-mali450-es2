@@ -30,6 +30,10 @@ Buffer create_buffer(GLenum target, uint64_t size, bool dynamic, bool persistent
 // call, no flush); otherwise glBufferSubData. `offset + size` must be within the buffer.
 void upload_buffer(const Buffer& buffer, uint64_t offset, const void* data, uint64_t size);
 
+// Return a readable range from an ES2 CPU-backed uniform buffer. Native UBO
+// builds return null; callers use this only for classic glUniform emulation.
+const uint8_t* uniform_buffer_data(GLuint id, uint64_t offset, uint64_t size) noexcept;
+
 void destroy_buffer(Buffer& buffer) noexcept;
 
 } // namespace aurora::gl

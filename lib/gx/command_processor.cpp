@@ -10,6 +10,7 @@
 #include "../internal.hpp"
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/base/casts.h>
 #include <tracy/Tracy.hpp>
 
 #include <bit>
@@ -1841,7 +1842,7 @@ static f32 read_component_as_float(const u8* p, GXCompType type, u8 frac, bool b
   case GX_S16:
     return static_cast<f32>(static_cast<int16_t>(read_u16(p, bigEndian))) * scale;
   case GX_F32:
-    return std::bit_cast<f32>(read_u32(p, bigEndian));
+    return absl::bit_cast<f32>(read_u32(p, bigEndian));
   default:
     return 0.0f;
   }
@@ -2033,9 +2034,17 @@ static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const
     const auto attr = d.attr;
     const auto compType = static_cast<GXCompType>(d.compType);
     if (attr == GX_VA_PNMTXIDX) {
+#ifdef AURORA_GLES2
+      out.append<f32>(static_cast<f32>(u32(*p) / 3u));
+#else
       out.append<u32>(u32(*p) / 3u); // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
+#endif
     } else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
+#ifdef AURORA_GLES2
+      out.append<f32>(static_cast<f32>(u32(*p)));
+#else
       out.append<u32>(u32(*p)); // raw; shader divides by 3
+#endif
     } else if (attr == GX_VA_POS || attr == GX_VA_NRM) {
       for (int c = 0; c < 3; ++c) {
         out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
@@ -2080,7 +2089,11 @@ static constexpr size_t kNativeGeomCacheMinBytes = 64;
 // so a run of adjacent strip draws collapses to one DrawIndexed, instead of unrolling
 // each into an independent triangle list. This is the top CPU-side draw-submission lever:
 // far fewer draw commands and index bytes in strip-heavy world scenes.
+#ifdef AURORA_GLES2
+static constexpr bool kStripTopology = false;
+#else
 static constexpr bool kStripTopology = true;
+#endif
 
 // Emit a periodic one-line cache/batching summary to confirm the geometry cache is
 // actually hitting on-device (and how effective run-batching is). Perf-tuning scaffolding;
@@ -2253,11 +2266,15 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
         cached = true;
         s_nativeGeomCache.emplace(key, NativeGeomEntry{.vertRange = cv, .idxRange = ci, .indexCount = numIndices});
         s_nativeGeomSeen.erase(seenIt);
-        ++s_geomCachePromotes;
+        if constexpr (kLogNativeGeomCacheStats) {
+          ++s_geomCachePromotes;
+        }
         return;
       }
       // Cache exhausted — recycle it at the next frame boundary and use the ring now.
-      ++s_geomCacheFull;
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomCacheFull;
+      }
       gfx::request_native_geometry_cache_reset();
     } else if (!inserted) {
       seenIt->second = frame;
@@ -2267,7 +2284,9 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
     }
   }
   // Per-frame ring fallback.
-  ++s_geomCacheRingPushes;
+  if constexpr (kLogNativeGeomCacheStats) {
+    ++s_geomCacheRingPushes;
+  }
   vertRange = gfx::push_verts(vtxBytes.data(), vtxBytes.size(), 4);
   if (idxData != nullptr && idxBytes > 0) {
     idxRange = gfx::push_indices(idxData, idxBytes, 4);
@@ -2278,8 +2297,24 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                 const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
                                 gfx::Range vertRange, gfx::Range idxRange, u32 numIndices, bool cachedGeometry = false,
                                 bool stripTopology = false) {
+  const bool stateUnchanged = !g_gxState.stateDirty;
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
+  // The storage shader expands GX lines/points into instanced screen-space quads.
+  // ES2 has no usable instancing path on this Mali, so submit the original vertices
+  // through fixed-function line/point rasterization instead. This preserves the
+  // geometry and TEV result (at the implementation's supported raster width) rather
+  // than dropping the draw entirely.
+  if (prim == GX_LINES) {
+    config.shaderConfig.lineMode = 0;
+    config.nativeRasterTopology = 1;
+  } else if (prim == GX_LINESTRIP) {
+    config.shaderConfig.lineMode = 0;
+    config.nativeRasterTopology = 2;
+  } else if (prim == GX_POINTS) {
+    config.shaderConfig.lineMode = 0;
+    config.nativeRasterTopology = 3;
+  }
   config.shaderConfig.attrs = nativeAttrs;
   config.shaderConfig.vtxStride = nativeStride;
   config.shaderConfig.nativeVertexFetch = 1;
@@ -2290,12 +2325,34 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   const auto bindGroups = build_bind_groups(info);
   const auto pipeline = gfx::pipeline_ref(config);
 
+  // A triangle list with unchanged GX state can share the previous native draw when
+  // both pieces are adjacent in the same backing buffer. This is the native-fetch
+  // counterpart of draw_prim's long-standing storage-path merge: no reordering and
+  // no blend/depth/texture assumption is involved. Indexed and strip draws stay
+  // separate because their element bases/topology cannot be concatenated in GLES2.
+  auto* lastDraw = stateUnchanged ? gfx::get_last_draw_command<DrawData>() : nullptr;
+  const bool canMerge = prim == GX_TRIANGLES && numIndices == 0 && lastDraw != nullptr &&
+                        lastDraw->nativeVertexFetch && lastDraw->indexCount == 0 && lastDraw->instanceCount == 1 &&
+                        lastDraw->pipeline == pipeline &&
+                        lastDraw->bindGroups.textureBindGroup == bindGroups.textureBindGroup &&
+                        lastDraw->dstAlpha == g_gxState.dstAlpha && lastDraw->cachedGeometry == cachedGeometry &&
+                        lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset;
+  if (canMerge) {
+    lastDraw->vertRange.size += vertRange.size;
+    lastDraw->vtxCount += vtxCount;
+    ++gfx::g_mergedDrawCallCount;
+    return;
+  }
+
   BindGroupRanges ranges{}; // native resolves indexed attrs on the CPU — no array uploads
   gfx::push_draw_command(DrawData{
       .pipeline = pipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
-      .uniformRange = build_uniform(info, vertRange.offset, ranges),
+      // Native shaders read real vertex attributes, so the storage-ring byte offset
+      // in u_data[0].x is dead. Keeping it zero avoids a needless uniform change for
+      // otherwise-identical draws that reference different geometry.
+      .uniformRange = build_uniform(info, 0, ranges),
       .vtxCount = vtxCount,
       .indexCount = numIndices,
       .instanceCount = 1,
@@ -2309,7 +2366,8 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
 // Expand `vtxCount` raw FIFO vertices and push a native draw, serving steady-state
 // geometry from the persistent content-hash cache (no re-expand, no re-upload).
 static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize) {
-  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
+  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS &&
+      prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS) {
     return false;
   }
   u8 nativeStride = 0;
@@ -2317,7 +2375,9 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   if (!build_native_layout(fmt, s_nativeDescs, nativeStride, nativeAttrs)) {
     return false;
   }
-  ++s_geomDrawsSingle;
+  if constexpr (kLogNativeGeomCacheStats) {
+    ++s_geomDrawsSingle;
+  }
   const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
 
   // Content-hash key: source FIFO bytes + decode layout (+ indexed array contents). A hit
@@ -2335,13 +2395,17 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
     key = {fifo.digest(), meta.digest(), srcBytes};
     native_geom_sync_generation();
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
-      ++s_geomCacheHits;
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomCacheHits;
+      }
       pos += srcBytes;
       push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange, it->second.idxRange,
                           it->second.indexCount, /*cachedGeometry=*/true);
       return true;
     }
-    ++s_geomCacheMisses;
+    if constexpr (kLogNativeGeomCacheStats) {
+      ++s_geomCacheMisses;
+    }
   }
 
   // Miss — expand the run into flat native attributes.
@@ -2353,7 +2417,8 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   pos += srcBytes;
 
   // Strips/fans/quads get a generated index buffer; plain triangle lists draw non-indexed.
-  const bool indexed = prim != GX_TRIANGLES;
+  const bool rasterPrimitive = prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS;
+  const bool indexed = prim != GX_TRIANGLES && !rasterPrimitive;
   u32 numIndices = 0;
   s_nativeIdxBuf.clear();
   if (indexed) {
@@ -2421,8 +2486,10 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
     scan += 3 + nextVtxBytes;
   }
 
-  ++s_geomRunsBatched;
-  s_geomSegmentsBatched += segCounts.size();
+  if constexpr (kLogNativeGeomCacheStats) {
+    ++s_geomRunsBatched;
+    s_geomSegmentsBatched += segCounts.size();
+  }
   const bool stripTopology = prim == GX_TRIANGLESTRIP && kStripTopology;
   const u32 srcBytes = batchVtxCount * vtxSize;
 
@@ -2444,13 +2511,17 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
     key = {fifo.digest(), meta.digest(), srcBytes};
     native_geom_sync_generation();
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
-      ++s_geomCacheHits;
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomCacheHits;
+      }
       pos = scan;
       push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, it->second.vertRange,
                           it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true, stripTopology);
       return true;
     }
-    ++s_geomCacheMisses;
+    if constexpr (kLogNativeGeomCacheStats) {
+      ++s_geomCacheMisses;
+    }
   }
 
   // Miss — expand every segment into flat native attributes (contiguous in one buffer).
@@ -2521,12 +2592,16 @@ static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u
     key = {fifo.digest(), meta.digest(), srcBytes};
     native_geom_sync_generation();
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
-      ++s_geomCacheHits;
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomCacheHits;
+      }
       push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange,
                           it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true);
       return true;
     }
-    ++s_geomCacheMisses;
+    if constexpr (kLogNativeGeomCacheStats) {
+      ++s_geomCacheMisses;
+    }
   }
 
   s_nativeVtxBuf.clear();
@@ -2548,7 +2623,9 @@ static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u
 // emit one native draw (served from the content-hash cache on recurrence).
 static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
                                     u32 idxBytes, u32 indexCount) {
-  ++s_geomDrawsIndexed;
+  if constexpr (kLogNativeGeomCacheStats) {
+    ++s_geomDrawsIndexed;
+  }
   return native_emit_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount);
 }
 

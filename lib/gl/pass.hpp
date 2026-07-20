@@ -27,6 +27,8 @@ inline constexpr uint64_t kWholeSize = ~uint64_t{0};
 // Drop the cached native-layout VAOs. Call on the render worker before the GL
 // context goes away (shutdown / context loss); the GL names become invalid then.
 void reset_pass_vao_cache() noexcept;
+// Bind the shared position/UV fullscreen triangle used by GLES2 utility draws.
+void bind_fullscreen_triangle();
 
 // The framebuffer a pass renders into. width/height drive the top-left ->
 // bottom-left origin conversion for viewport/scissor (seam S1b).
@@ -43,7 +45,8 @@ public:
   void SetPipeline(const Pipeline& pipeline);
   void SetBindGroup(uint32_t index, const BindingSet& set, size_t dynamicOffsetCount = 0,
                     const uint32_t* dynamicOffsets = nullptr);
-  void SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset = 0, uint64_t size = kWholeSize);
+  void SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset = 0, uint64_t size = kWholeSize,
+                       bool stableLayout = false);
   void SetIndexBuffer(const Buffer& buffer, IndexFormat format, uint64_t offset = 0, uint64_t size = kWholeSize);
   void SetViewport(float x, float y, float width, float height, float minDepth, float maxDepth);
   void SetScissorRect(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
@@ -70,6 +73,7 @@ private:
   bool m_hasPipeline = false;
   Buffer m_vertexBuffer{};
   uint64_t m_vertexOffset = 0;
+  bool m_stableVertexLayout = false;
   Buffer m_indexBuffer{};
   IndexFormat m_indexFormat = IndexFormat::Uint16;
   uint64_t m_indexOffset = 0;

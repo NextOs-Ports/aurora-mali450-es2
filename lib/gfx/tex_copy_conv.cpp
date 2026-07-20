@@ -11,6 +11,7 @@
 #include "../gl/fbo_cache.hpp"
 #include "../gl/gl_core.hpp"
 #include "../gl/program.hpp"
+#include "../gl/pass.hpp"
 #include "../gl/state.hpp"
 #include "../gl/textures.hpp"
 #include "render_worker.hpp"
@@ -38,6 +39,19 @@ constexpr uint32_t kUvBlockBinding = 0;
 
 // Shared fullscreen-triangle vertex shader: emit the big triangle from gl_VertexID and
 // map its [0,1] UV through the crop transform (offset + scale). Matches the WGSL vs_main.
+#ifdef AURORA_GLES2
+constexpr char kVertexSource[] = R"(#version 100
+precision highp float;
+uniform vec4 u_data[1];
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv = a_uv * u_data[0].zw + u_data[0].xy;
+}
+)";
+#else
 constexpr char kVertexSource[] = R"(#version 300 es
 layout(std140) uniform UVTransform {
   vec2 uv_offset;
@@ -51,10 +65,22 @@ void main() {
   v_uv = uvs[gl_VertexID] * uv_scale + uv_offset;
 }
 )";
+#endif
 
 // Shared fragment preamble: highp (TEV-style intensity needs fp32), the src sampler on
 // unit 0, and the ITU-R BT.601 luma + 4-bit quantize helpers used by the intensity/CTF
 // conversions. Per-format fragment bodies are appended.
+#ifdef AURORA_GLES2
+constexpr std::string_view kFragPreamble = R"(#version 100
+precision highp float;
+uniform sampler2D src;
+varying vec2 v_uv;
+#define out_color gl_FragColor
+#define texture texture2D
+float intensity(vec3 rgb) { return dot(rgb, vec3(0.257, 0.504, 0.098)) + 16.0 / 255.0; }
+float quantize4(float v) { return floor(v * 16.0) / 15.0; }
+)";
+#else
 constexpr std::string_view kFragPreamble = R"(#version 300 es
 precision highp float;
 uniform sampler2D src;
@@ -63,6 +89,7 @@ out vec4 out_color;
 float intensity(vec3 rgb) { return dot(rgb, vec3(0.257, 0.504, 0.098)) + 16.0 / 255.0; }
 float quantize4(float v) { return floor(v * 16.0) / 15.0; }
 )";
+#endif
 
 // Passthrough blit (scaling copies)
 constexpr std::string_view FragPassthrough = R"(
@@ -171,10 +198,14 @@ static gl::Pipeline create_pipeline(std::string_view fragBody, const char* label
   const std::string frag = std::string{kFragPreamble} + std::string{fragBody};
   const gl::GLuint program = gl::compile_program(kVertexSource, frag.c_str(), label);
   if (program != 0) {
+#ifdef AURORA_GLES2
+    gl::register_uniform_binding(program, kUvBlockBinding, "u_data", 16);
+#else
     const gl::GLuint blockIndex = gl::gl.GetUniformBlockIndex(program, "UVTransform");
     if (blockIndex != 0xFFFFFFFFu) {
       gl::gl.UniformBlockBinding(program, blockIndex, kUvBlockBinding);
     }
+#endif
     gl::gl.UseProgram(program);
     const gl::GLint srcLoc = gl::gl.GetUniformLocation(program, "src");
     if (srcLoc >= 0) {
@@ -183,7 +214,15 @@ static gl::Pipeline create_pipeline(std::string_view fragBody, const char* label
     gl::gl.UseProgram(0);
     gl::gl.Flush();
   }
-  return gl::Pipeline{.program = program, .state = conv_state(), .vertexLayout = 0};
+  return gl::Pipeline{
+      .program = program,
+      .state = conv_state(),
+#ifdef AURORA_GLES2
+      .vertexLayout = gl::kFullscreenVertexLayout,
+#else
+      .vertexLayout = 0,
+#endif
+  };
 }
 
 bool needs_conversion(const GXTexFmt fmt) { return g_pipelines.contains(fmt); }
@@ -239,8 +278,13 @@ static void execute(const ConvRequest& req, const gl::Pipeline& pipeline) {
   // desyncs the state-cache shadow, so reset it before the draw re-applies baked state.
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
   gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+#ifdef AURORA_GLES2
+  gl::gl.ClearColor(0.f, 0.f, 0.f, 0.f);
+  gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
+#else
   const gl::GLfloat clearColor[4]{0.f, 0.f, 0.f, 0.f};
   gl::gl.ClearBufferfv(gl::GL_COLOR, 0, clearColor);
+#endif
   gl::reset_state_cache();
 
   gl::set_viewport_gl(0, 0, static_cast<gl::GLsizei>(req.dst->size.width),
@@ -250,7 +294,11 @@ static void execute(const ConvRequest& req, const gl::Pipeline& pipeline) {
   const gl::GLuint sampler = req.sampleFilter == SampleFilter::Linear ? g_linearSampler.id : g_nearestSampler.id;
   gl::bind_texture_unit(0, req.srcView.id, sampler);
   gl::bind_uniform_range(kUvBlockBinding, g_uniformBuffer.id, req.uniformRange.offset, req.uniformRange.size);
+#ifdef AURORA_GLES2
+  gl::bind_fullscreen_triangle();
+#else
   gl::bind_vertex_array(0);
+#endif
   gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
   gl::gl.Enable(gl::GL_SCISSOR_TEST);
 }

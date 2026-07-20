@@ -60,7 +60,11 @@ struct AttrSpec {
 
 AttrSpec attr_spec(int attr) {
   if (attr == canon::kPnMtxIdx || (attr >= canon::kTexMtxIdx0 && attr <= canon::kTexMtxIdx7)) {
+#ifdef AURORA_GLES2
+    return {1, GL_FLOAT, false, false, 4};
+#else
     return {1, GL_UNSIGNED_INT, false, true, 4}; // Uint32 matrix index (S5)
+#endif
   }
   if (attr == canon::kPos || attr == canon::kNrm) {
     return {3, GL_FLOAT, false, false, 12};
@@ -75,6 +79,28 @@ AttrSpec attr_spec(int attr) {
 // across contexts). Enable-mask + attrib formats live in the VAO; the per-draw base
 // offset is re-specified each draw (the vertex data sits at a dynamic ring offset).
 absl::flat_hash_map<uint32_t, GLuint> g_vaoCache;
+struct StableVaoKey {
+  uint32_t mask;
+  GLuint vertexBuffer;
+  GLuint indexBuffer;
+  uint64_t baseOffset;
+
+  bool operator==(const StableVaoKey& rhs) const noexcept {
+    return mask == rhs.mask && vertexBuffer == rhs.vertexBuffer && indexBuffer == rhs.indexBuffer &&
+           baseOffset == rhs.baseOffset;
+  }
+};
+struct StableVaoKeyHash {
+  size_t operator()(const StableVaoKey& key) const noexcept {
+    size_t h = key.mask;
+    h ^= static_cast<size_t>(key.vertexBuffer) * 0x9e3779b1u;
+    h ^= static_cast<size_t>(key.indexBuffer) * 0x85ebca6bu;
+    h ^= static_cast<size_t>(key.baseOffset ^ (key.baseOffset >> 32)) * 0xc2b2ae35u;
+    return h;
+  }
+};
+absl::flat_hash_map<StableVaoKey, GLuint, StableVaoKeyHash> g_stableVaoCache;
+GLuint g_fullscreenVbo = 0;
 
 GLuint get_or_create_vao(uint32_t mask, bool& created) {
   const auto it = g_vaoCache.find(mask);
@@ -91,10 +117,29 @@ GLuint get_or_create_vao(uint32_t mask, bool& created) {
 
 // Bind the layout VAO and (re)point its attributes at `vbuf` + `baseOffset`, then bind
 // `ibuf` as the element array (VAO state). Mirrors the CPU vertex record exactly.
-void bind_gx_layout(uint32_t mask, const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf) {
+void bind_gx_layout(uint32_t mask, const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf, bool stableLayout) {
   bool created = false;
-  const GLuint vao = get_or_create_vao(mask, created);
+  GLuint vao = 0;
+  if (stableLayout) {
+    const StableVaoKey key{mask, vbuf.id, ibuf.id, baseOffset};
+    const auto [it, inserted] = g_stableVaoCache.try_emplace(key, 0);
+    created = inserted;
+    if (inserted) {
+      gl.GenVertexArrays(1, &it->second);
+    }
+    vao = it->second;
+  } else {
+    vao = get_or_create_vao(mask, created);
+  }
   bind_vertex_array(vao);
+
+  // Persistent geometry never moves inside its buffers. A VAO records both the
+  // attribute buffer/offsets and the element buffer, so a cache hit needs only
+  // glBindVertexArray instead of reissuing every glVertexAttribPointer. On this
+  // GLES2 Mali driver that removes several GL calls from almost every world draw.
+  if (stableLayout && !created) {
+    return;
+  }
 
   uint32_t stride = 0;
   for (int i = 0; i < canon::kCount; ++i) {
@@ -154,9 +199,40 @@ void bind_rml_layout(const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf
                          reinterpret_cast<const void*>(baseOffset + kColourOffset));
   gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
 }
+
+void bind_fullscreen_layout_impl() {
+  bool created = false;
+  const GLuint vao = get_or_create_vao(kFullscreenVertexLayout, created);
+  bind_vertex_array(vao);
+  if (g_fullscreenVbo == 0) {
+    // Same oversized triangle as the ES3 gl_VertexID path: position.xy, uv.xy.
+    constexpr GLfloat vertices[]{
+        -1.f, 1.f, 0.f, 0.f,
+        -1.f, -3.f, 0.f, 2.f,
+        3.f, 1.f, 2.f, 0.f,
+    };
+    gl.GenBuffers(1, &g_fullscreenVbo);
+    gl.BindBuffer(GL_ARRAY_BUFFER, g_fullscreenVbo);
+    gl.BufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+  } else {
+    gl.BindBuffer(GL_ARRAY_BUFFER, g_fullscreenVbo);
+  }
+  if (created) {
+    gl.EnableVertexAttribArray(0);
+    gl.EnableVertexAttribArray(1);
+    gl.VertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+    gl.VertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                           reinterpret_cast<const void*>(2 * sizeof(GLfloat)));
+  }
+}
 } // namespace
 
-void reset_pass_vao_cache() noexcept { g_vaoCache.clear(); }
+void bind_fullscreen_triangle() { bind_fullscreen_layout_impl(); }
+
+void reset_pass_vao_cache() noexcept {
+  g_vaoCache.clear();
+  g_stableVaoCache.clear();
+}
 
 void PassEncoder::SetPipeline(const Pipeline& pipeline) {
   m_pipeline = pipeline;
@@ -188,11 +264,13 @@ void PassEncoder::SetBindGroup(uint32_t index, const BindingSet& set, size_t dyn
   }
 }
 
-void PassEncoder::SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset, uint64_t size) {
+void PassEncoder::SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset, uint64_t size,
+                                  bool stableLayout) {
   (void)slot;
   (void)size;
   m_vertexBuffer = buffer;
   m_vertexOffset = offset;
+  m_stableVertexLayout = stableLayout;
 }
 
 void PassEncoder::SetIndexBuffer(const Buffer& buffer, IndexFormat format, uint64_t offset, uint64_t size) {
@@ -236,10 +314,12 @@ void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t fi
   }
   if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
     bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  } else if (m_pipeline.vertexLayout == kFullscreenVertexLayout) {
+    bind_fullscreen_layout_impl();
   } else if (m_pipeline.vertexLayout != 0) {
     // Native non-indexed GX draw: base offset is folded into the attrib pointers, so
     // firstVertex stays 0 relative to that base.
-    bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+    bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer, m_stableVertexLayout);
   } else {
     // Attribute-less draw (clear / present / RmlUi fullscreen triangle via gl_VertexID).
     bind_vertex_array(0);
@@ -263,7 +343,7 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
   if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
     bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
   } else {
-    bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+    bind_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer, m_stableVertexLayout);
   }
   const GLenum mode = topology_gl(m_pipeline.state.topology);
   const bool u32 = m_indexFormat == IndexFormat::Uint32;

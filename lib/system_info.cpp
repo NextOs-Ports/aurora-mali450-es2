@@ -17,7 +17,7 @@ extern "C" NTSYSAPI NTSTATUS NTAPI RtlGetVersion(PRTL_OSVERSIONINFOEXW lpVersion
 #elif __APPLE__
 #include "sys/sysctl.h"
 #elif linux
-#include <ranges>
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <sys/sysinfo.h>
@@ -301,12 +301,12 @@ void LogMisc() {
 
 // https://stackoverflow.com/questions/216823/how-can-i-trim-a-stdstring
 static void ltrim(std::string &s) {
-  s.erase(s.begin(), std::ranges::find_if(s.begin(), s.end(), [](unsigned char ch) {
+  s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
     return !std::isspace(ch);
   }));
 }
 static void rtrim(std::string &s) {
-    s.erase(std::ranges::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) {
         return !std::isspace(ch);
     }).base(), s.end());
 }

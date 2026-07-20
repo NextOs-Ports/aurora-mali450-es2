@@ -23,7 +23,7 @@ struct DrawData {
   bool cachedGeometry = false;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 15;
+constexpr uint32_t GXPipelineConfigVersion = 16;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;
@@ -38,6 +38,10 @@ struct PipelineConfig {
   // primitive + 0xffff primitive-restart separators) instead of being unrolled to a
   // triangle list. Set by the native strip-batching path; drives to_primitive_state.
   uint32_t triangleStripTopology;
+  // Native GLES2 fallback for GX line/point primitives. The storage path expands
+  // these to wide quads with instancing, which Mali-450 cannot provide. Values:
+  // 0 triangle, 1 line-list, 2 line-strip, 3 point-list.
+  uint32_t nativeRasterTopology;
   uint32_t polygonOffsetBits;
   uint32_t polygonOffsetScaleBits;
   uint32_t polygonOffsetClampBits;

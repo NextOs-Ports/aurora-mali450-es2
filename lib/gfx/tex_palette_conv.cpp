@@ -8,6 +8,7 @@
 #include "../gl/fbo_cache.hpp"
 #include "../gl/gl_core.hpp"
 #include "../gl/program.hpp"
+#include "../gl/pass.hpp"
 #include "../gl/state.hpp"
 #include "../gl/textures.hpp"
 #include "render_worker.hpp"
@@ -19,6 +20,18 @@ static Module Log("aurora::gfx::tex_palette_conv");
 
 // Shared fullscreen-triangle vertex shader (no crop transform: paletted textures resolve
 // 1:1). Matches the WGSL vs_main.
+#ifdef AURORA_GLES2
+constexpr char kVertexSource[] = R"(#version 100
+precision highp float;
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv = a_uv;
+}
+)";
+#else
 constexpr char kVertexSource[] = R"(#version 300 es
 out vec2 v_uv;
 void main() {
@@ -28,9 +41,44 @@ void main() {
   v_uv = uvs[gl_VertexID];
 }
 )";
+#endif
 
 // Direct: R16I index texture (isampler2D) -> TLUT lookup. texelFetch for both (integer
 // index, no filtering) -- the WGSL textureLoad maps 1:1.
+#ifdef AURORA_GLES2
+constexpr char kFragDirect[] = R"(#version 100
+precision highp float;
+uniform sampler2D src;
+uniform sampler2D tlut;
+varying vec2 v_uv;
+void main() {
+  float index = floor(texture2D(src, v_uv).r * 255.0 + 0.5);
+  gl_FragColor = texture2D(tlut, vec2((index + 0.5) / 256.0, 0.5));
+}
+)";
+
+constexpr char kFragFromFloat8[] = R"(#version 100
+precision highp float;
+uniform sampler2D src;
+uniform sampler2D tlut;
+varying vec2 v_uv;
+void main() {
+  float index = floor(texture2D(src, v_uv).r * 255.0 + 0.5);
+  gl_FragColor = texture2D(tlut, vec2((index + 0.5) / 256.0, 0.5));
+}
+)";
+
+constexpr char kFragFromFloat4[] = R"(#version 100
+precision highp float;
+uniform sampler2D src;
+uniform sampler2D tlut;
+varying vec2 v_uv;
+void main() {
+  float index = floor(texture2D(src, v_uv).r * 15.0 + 0.5);
+  gl_FragColor = texture2D(tlut, vec2((index + 0.5) / 16.0, 0.5));
+}
+)";
+#else
 constexpr char kFragDirect[] = R"(#version 300 es
 precision highp float;
 precision highp int;
@@ -80,6 +128,7 @@ void main() {
   out_color = texelFetch(tlut, ivec2(int(r * 15.0 + 0.5), 0), 0);
 }
 )";
+#endif
 
 static gl::Pipeline g_directPipeline;
 static gl::Pipeline g_fromFloat8Pipeline;
@@ -114,7 +163,15 @@ static gl::Pipeline create_pipeline(const char* fragSource, const char* label) {
     gl::gl.UseProgram(0);
     gl::gl.Flush();
   }
-  return gl::Pipeline{.program = program, .state = palette_state(), .vertexLayout = 0};
+  return gl::Pipeline{
+      .program = program,
+      .state = palette_state(),
+#ifdef AURORA_GLES2
+      .vertexLayout = gl::kFullscreenVertexLayout,
+#else
+      .vertexLayout = 0,
+#endif
+  };
 }
 
 static const gl::Pipeline& pipeline_for_variant(Variant variant) {
@@ -159,8 +216,13 @@ void run(const ConvRequest& req) {
 
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
   gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+#ifdef AURORA_GLES2
+  gl::gl.ClearColor(0.f, 0.f, 0.f, 0.f);
+  gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
+#else
   const gl::GLfloat clearColor[4]{0.f, 0.f, 0.f, 0.f};
   gl::gl.ClearBufferfv(gl::GL_COLOR, 0, clearColor);
+#endif
   gl::reset_state_cache();
 
   gl::set_viewport_gl(0, 0, static_cast<gl::GLsizei>(req.dst->size.width),
@@ -169,7 +231,11 @@ void run(const ConvRequest& req) {
   gl::apply_baked_state(pipeline.state);
   gl::bind_texture_unit(0, req.src->sampleTextureView.id, g_sampler.id);
   gl::bind_texture_unit(1, req.tlut->sampleTextureView.id, g_sampler.id);
+#ifdef AURORA_GLES2
+  gl::bind_fullscreen_triangle();
+#else
   gl::bind_vertex_array(0);
+#endif
   gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
   gl::gl.Enable(gl::GL_SCISSOR_TEST);
 }

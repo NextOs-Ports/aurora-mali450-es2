@@ -45,6 +45,9 @@ add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
 target_link_libraries(aurora_gx PUBLIC aurora::core xxhash)
+if (AURORA_GLES2)
+    target_compile_definitions(aurora_gx PUBLIC AURORA_GLES2)
+endif ()
 target_link_libraries(aurora_gx PRIVATE absl::btree absl::flat_hash_map sqlite3 TracyClient PNG::PNG)
 
 if (AURORA_ENABLE_RMLUI)

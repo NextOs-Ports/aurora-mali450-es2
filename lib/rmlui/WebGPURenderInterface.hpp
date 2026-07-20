@@ -46,8 +46,13 @@ struct SimpleFilterUniformBlock {
 };
 
 struct GradientUniformBlock {
+#ifdef AURORA_GLES2
+  float function;
+  float numStops;
+#else
   int32_t function;
   int32_t numStops;
+#endif
   Rml::Vector2f p;
   Rml::Vector2f v;
   Rml::Vector2f padding;

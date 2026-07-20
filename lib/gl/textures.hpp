@@ -73,4 +73,9 @@ Sampler create_sampler(const SamplerDescriptor& desc, bool anisotropySupported);
 
 void destroy_sampler(Sampler& sampler) noexcept;
 
+// ES2 has no sampler objects. In that build sampler handles name CPU-side
+// descriptors and this applies the exact descriptor to the currently bound
+// GL_TEXTURE_2D. It is a no-op when native sampler objects are available.
+void apply_sampler_to_bound_texture(GLuint texture, GLuint sampler);
+
 } // namespace aurora::gl

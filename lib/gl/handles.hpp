@@ -90,6 +90,9 @@ struct BakedState {
 // present-attr bitmasks over bits 0..20, so the top bit never collides; the draw path
 // (pass.cpp) binds the fixed RmlUi VAO instead of decoding a GX attr mask for it.
 inline constexpr uint32_t kRmlGeometryVertexLayout = 0x80000000u;
+// GLES2 substitute for gl_VertexID fullscreen triangles. The shared VBO carries
+// position at location 0 and UV at location 1.
+inline constexpr uint32_t kFullscreenVertexLayout = 0x40000000u;
 
 struct Pipeline {
   GLuint program = 0;

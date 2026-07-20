@@ -12,6 +12,7 @@
 
 #include "../gfx/common.hpp"
 #include "../gl/gl_core.hpp"
+#include "../gl/program.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu.hpp"
@@ -70,6 +71,93 @@ void* g_sdl2Window = nullptr;
 Sdl2SwapWindowFn g_sdl2SwapWindow = nullptr;
 std::array<Slot, SlotCount> g_slots;
 
+#ifdef AURORA_GLES2
+// The firmware context is GLES2, so it cannot use glBlitFramebuffer to copy a
+// shared EFB slot into the window. These objects belong exclusively to the
+// main/shim context (VAOs are not shared between EGL contexts).
+gl::GLuint g_presentProgram = 0;
+gl::GLuint g_presentVbo = 0;
+gl::GLuint g_presentVao = 0;
+
+constexpr char kPresentVertex[] = R"(#version 100
+precision highp float;
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv = vec2(a_uv.x, 1.0 - a_uv.y);
+}
+)";
+
+constexpr char kPresentFragment[] = R"(#version 100
+precision mediump float;
+uniform sampler2D tex;
+varying vec2 v_uv;
+void main() {
+  vec4 color = texture2D(tex, v_uv);
+  gl_FragColor = vec4(color.rgb, 1.0);
+}
+)";
+
+bool create_present_resources() {
+  g_presentProgram = gl::compile_program(kPresentVertex, kPresentFragment, "SDL2-shim GLES2 present");
+  if (g_presentProgram == 0) {
+    return false;
+  }
+  gl::gl.UseProgram(g_presentProgram);
+  const gl::GLint sampler = gl::gl.GetUniformLocation(g_presentProgram, "tex");
+  if (sampler >= 0) {
+    gl::gl.Uniform1i(sampler, 0);
+  }
+  gl::gl.UseProgram(0);
+
+  // Oversized triangle: position.xy followed by uv.xy. The UV conversion in
+  // the vertex shader maps the GL-native bottom row to the window bottom.
+  constexpr gl::GLfloat vertices[]{
+      -1.f, 1.f, 0.f, 0.f,
+      -1.f, -3.f, 0.f, 2.f,
+      3.f, 1.f, 2.f, 0.f,
+  };
+  gl::gl.GenBuffers(1, &g_presentVbo);
+  gl::gl.GenVertexArrays(1, &g_presentVao);
+  if (g_presentVbo == 0 || g_presentVao == 0) {
+    Log.error("[sdl2shim-efb] failed to allocate GLES2 present geometry");
+    return false;
+  }
+  gl::gl.BindVertexArray(g_presentVao);
+  gl::gl.BindBuffer(gl::GL_ARRAY_BUFFER, g_presentVbo);
+  gl::gl.BufferData(gl::GL_ARRAY_BUFFER, sizeof(vertices), vertices, gl::GL_STATIC_DRAW);
+  gl::gl.EnableVertexAttribArray(0);
+  gl::gl.EnableVertexAttribArray(1);
+  gl::gl.VertexAttribPointer(0, 2, gl::GL_FLOAT, gl::GL_FALSE, 4 * sizeof(gl::GLfloat), nullptr);
+  gl::gl.VertexAttribPointer(1, 2, gl::GL_FLOAT, gl::GL_FALSE, 4 * sizeof(gl::GLfloat),
+                             reinterpret_cast<const void*>(2 * sizeof(gl::GLfloat)));
+  gl::gl.BindVertexArray(0);
+  gl::gl.BindBuffer(gl::GL_ARRAY_BUFFER, 0);
+  if (const auto err = gl::gl.GetError(); err != gl::GL_NO_ERROR) {
+    Log.error("[sdl2shim-efb] GLES2 present setup failed (GL 0x{:x})", err);
+    return false;
+  }
+  return true;
+}
+
+void destroy_present_resources() {
+  if (g_presentVao != 0) {
+    gl::gl.DeleteVertexArrays(1, &g_presentVao);
+    g_presentVao = 0;
+  }
+  if (g_presentVbo != 0) {
+    gl::gl.DeleteBuffers(1, &g_presentVbo);
+    g_presentVbo = 0;
+  }
+  if (g_presentProgram != 0) {
+    gl::gl.DeleteProgram(g_presentProgram);
+    g_presentProgram = 0;
+  }
+}
+#endif
+
 std::mutex g_mutex;
 std::condition_variable g_slotFreed;  // main -> worker
 std::condition_variable g_frameReady; // worker -> main
@@ -106,10 +194,22 @@ void* create_fence() {
 bool create_shim_slot(Slot& slot) {
   gl::gl.GenTextures(1, &slot.shimTexture);
   gl::gl.BindTexture(gl::GL_TEXTURE_2D, slot.shimTexture);
-  gl::gl.TexImage2D(gl::GL_TEXTURE_2D, 0, static_cast<gl::GLint>(gl::GL_RGBA8), static_cast<gl::GLsizei>(g_width),
+#ifdef AURORA_GLES2
+  // ES 2.0 requires the unsized internal format to match the external format.
+  // The Mali-450 advertises GL_OES_rgb8_rgba8, but passing GL_RGBA8 to the ES2
+  // glTexImage2D entry point is still rejected with GL_INVALID_VALUE.
+  constexpr gl::GLint kPresentInternalFormat = static_cast<gl::GLint>(gl::GL_RGBA);
+#else
+  constexpr gl::GLint kPresentInternalFormat = static_cast<gl::GLint>(gl::GL_RGBA8);
+#endif
+  gl::gl.TexImage2D(gl::GL_TEXTURE_2D, 0, kPresentInternalFormat, static_cast<gl::GLsizei>(g_width),
                     static_cast<gl::GLsizei>(g_height), 0, gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, nullptr);
-  // EGL_KHR_gl_texture_2D_image requires a complete texture; clamp it to the single level we defined.
+  // EGL_KHR_gl_texture_2D_image requires a complete texture. ES2 has no core
+  // TEXTURE_MAX_LEVEL; the non-mipmapped minification filter below makes this
+  // single-level texture complete on that API.
+#ifndef AURORA_GLES2
   gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAX_LEVEL, 0);
+#endif
   gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_NEAREST);
   gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_NEAREST);
   gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_S, gl::GL_CLAMP_TO_EDGE);
@@ -180,6 +280,20 @@ bool ensure_worker_slots() {
     Log.error("[sdl2shim-efb] glEGLImageTargetTexture2DOES unavailable; cannot alias EFB slots");
     return false;
   }
+  // The render worker may have inherited a non-fatal error from frame setup.
+  // Do not blame that stale flag on EGLImage import: drain it before checking
+  // each operation below individually.
+  gl::GLenum staleError = gl::GL_NO_ERROR;
+  for (;;) {
+    const auto err = gl::gl.GetError();
+    if (err == gl::GL_NO_ERROR) {
+      break;
+    }
+    staleError = err;
+  }
+  if (staleError != gl::GL_NO_ERROR) {
+    Log.warn("[sdl2shim-efb] cleared stale worker GL error 0x{:x} before EGLImage import", staleError);
+  }
   for (Slot& slot : g_slots) {
     if (slot.workerFbo != 0) {
       gl::gl.DeleteFramebuffers(1, &slot.workerFbo);
@@ -196,11 +310,15 @@ bool ensure_worker_slots() {
     gl::gl.GenTextures(1, &slot.workerTexture);
     gl::gl.BindTexture(gl::GL_TEXTURE_2D, slot.workerTexture);
     gl::gl.glEGLImageTargetTexture2DOES(gl::GL_TEXTURE_2D, slot.eglImage);
+    if (const auto err = gl::gl.GetError(); err != gl::GL_NO_ERROR) {
+      Log.error("[sdl2shim-efb] worker EGLImage import failed (GL 0x{:x})", err);
+      return false;
+    }
     gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_NEAREST);
     gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_NEAREST);
     gl::gl.BindTexture(gl::GL_TEXTURE_2D, 0);
     if (const auto err = gl::gl.GetError(); err != gl::GL_NO_ERROR) {
-      Log.error("[sdl2shim-efb] worker EGLImage alias failed (GL 0x{:x})", err);
+      Log.error("[sdl2shim-efb] worker EGLImage texture setup failed (GL 0x{:x})", err);
       return false;
     }
     gl::gl.GenFramebuffers(1, &slot.workerFbo);
@@ -231,6 +349,28 @@ void blit_and_swap(Slot& slot) {
     gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
   }
 
+#ifdef AURORA_GLES2
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+  gl::gl.Viewport(0, 0, drawableWidth, drawableHeight);
+  gl::gl.Disable(gl::GL_SCISSOR_TEST);
+  gl::gl.Disable(gl::GL_BLEND);
+  gl::gl.Disable(gl::GL_DEPTH_TEST);
+  gl::gl.Disable(gl::GL_STENCIL_TEST);
+  gl::gl.Disable(gl::GL_CULL_FACE);
+  gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+  gl::gl.ClearColor(0.f, 0.f, 0.f, 1.f);
+  gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
+  gl::gl.UseProgram(g_presentProgram);
+  gl::gl.ActiveTexture(gl::GL_TEXTURE0);
+  gl::gl.BindTexture(gl::GL_TEXTURE_2D, slot.shimTexture);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_LINEAR);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_LINEAR);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_S, gl::GL_CLAMP_TO_EDGE);
+  gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_T, gl::GL_CLAMP_TO_EDGE);
+  gl::gl.BindVertexArray(g_presentVao);
+  gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
+  gl::gl.BindVertexArray(0);
+#else
   gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, slot.shimReadFbo);
   gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, 0);
   gl::gl.Disable(gl::GL_SCISSOR_TEST);
@@ -239,6 +379,7 @@ void blit_and_swap(Slot& slot) {
   gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(g_width), static_cast<gl::GLint>(g_height), 0, 0, drawableWidth,
                          drawableHeight, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
   gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, 0);
+#endif
 
   if (g_sdl2SwapWindow != nullptr && g_sdl2Window != nullptr) {
     g_sdl2SwapWindow(g_sdl2Window);
@@ -282,11 +423,21 @@ bool initialize(void* eglDisplay, uint32_t width, uint32_t height, gl::TextureFo
   g_sdl2SwapWindow =
       reinterpret_cast<Sdl2SwapWindowFn>(SDL_GetPointerProperty(props, SDL2_SHIM_GL_SWAP_WINDOW_PROP, nullptr));
 
+#ifdef AURORA_GLES2
+  if (!create_present_resources()) {
+    destroy_present_resources();
+    return false;
+  }
+#endif
+
   for (uint32_t i = 0; i < SlotCount; ++i) {
     if (!create_shim_slot(g_slots[i])) {
       for (uint32_t j = 0; j <= i; ++j) {
         destroy_shim_slot(g_slots[j]);
       }
+#ifdef AURORA_GLES2
+      destroy_present_resources();
+#endif
       return false;
     }
     g_slots[i].state = SlotState::Free;
@@ -321,6 +472,9 @@ bool resize(uint32_t width, uint32_t height, gl::TextureFormat format) {
   for (Slot& slot : g_slots) {
     destroy_shim_slot(slot);
   }
+#ifdef AURORA_GLES2
+  destroy_present_resources();
+#endif
   g_width = width;
   g_height = height;
   g_nextSlot = 0;

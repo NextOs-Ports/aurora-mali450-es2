@@ -65,8 +65,8 @@ bool load(ProcAddressFn getProc) {
   REQ(BindBuffer, "glBindBuffer")
   REQ(BufferData, "glBufferData")
   REQ(BufferSubData, "glBufferSubData")
-  REQ(BindBufferRange, "glBindBufferRange")
-  REQ(BindBufferBase, "glBindBufferBase")
+  OPT(BindBufferRange, "glBindBufferRange")
+  OPT(BindBufferBase, "glBindBufferBase")
   OPT(MapBufferRange, "glMapBufferRange")
   OPT(UnmapBuffer, "glUnmapBuffer")
   OPT(FlushMappedBufferRange, "glFlushMappedBufferRange")
@@ -78,20 +78,30 @@ bool load(ProcAddressFn getProc) {
   }
 
   // Vertex arrays
-  REQ(GenVertexArrays, "glGenVertexArrays")
-  REQ(DeleteVertexArrays, "glDeleteVertexArrays")
-  REQ(BindVertexArray, "glBindVertexArray")
+  OPT(GenVertexArrays, "glGenVertexArrays")
+  OPT(DeleteVertexArrays, "glDeleteVertexArrays")
+  OPT(BindVertexArray, "glBindVertexArray")
+#ifdef AURORA_GLES2
+  if (gl.GenVertexArrays == nullptr) OPT(GenVertexArrays, "glGenVertexArraysOES")
+  if (gl.DeleteVertexArrays == nullptr) OPT(DeleteVertexArrays, "glDeleteVertexArraysOES")
+  if (gl.BindVertexArray == nullptr) OPT(BindVertexArray, "glBindVertexArrayOES")
+#endif
+  if (gl.GenVertexArrays == nullptr || gl.DeleteVertexArrays == nullptr || gl.BindVertexArray == nullptr) {
+    Log.warn("[gl] missing required vertex-array entry points");
+    missing = true;
+  }
   REQ(EnableVertexAttribArray, "glEnableVertexAttribArray")
   REQ(DisableVertexAttribArray, "glDisableVertexAttribArray")
   REQ(VertexAttribPointer, "glVertexAttribPointer")
-  REQ(VertexAttribIPointer, "glVertexAttribIPointer")
+  OPT(VertexAttribIPointer, "glVertexAttribIPointer")
 
   // Textures
   REQ(GenTextures, "glGenTextures")
   REQ(DeleteTextures, "glDeleteTextures")
   REQ(BindTexture, "glBindTexture")
   REQ(ActiveTexture, "glActiveTexture")
-  REQ(TexStorage2D, "glTexStorage2D")
+  OPT(TexStorage2D, "glTexStorage2D")
+  if (gl.TexStorage2D == nullptr) OPT(TexStorage2D, "glTexStorage2DEXT")
   REQ(TexImage2D, "glTexImage2D")
   REQ(TexSubImage2D, "glTexSubImage2D")
   OPT(CompressedTexImage2D, "glCompressedTexImage2D")
@@ -103,11 +113,11 @@ bool load(ProcAddressFn getProc) {
   REQ(PixelStorei, "glPixelStorei")
 
   // Sampler objects
-  REQ(GenSamplers, "glGenSamplers")
-  REQ(DeleteSamplers, "glDeleteSamplers")
-  REQ(BindSampler, "glBindSampler")
-  REQ(SamplerParameteri, "glSamplerParameteri")
-  REQ(SamplerParameterf, "glSamplerParameterf")
+  OPT(GenSamplers, "glGenSamplers")
+  OPT(DeleteSamplers, "glDeleteSamplers")
+  OPT(BindSampler, "glBindSampler")
+  OPT(SamplerParameteri, "glSamplerParameteri")
+  OPT(SamplerParameterf, "glSamplerParameterf")
 
   // Framebuffers / renderbuffers
   REQ(GenFramebuffers, "glGenFramebuffers")
@@ -116,10 +126,11 @@ bool load(ProcAddressFn getProc) {
   REQ(FramebufferTexture2D, "glFramebufferTexture2D")
   REQ(FramebufferRenderbuffer, "glFramebufferRenderbuffer")
   REQ(CheckFramebufferStatus, "glCheckFramebufferStatus")
-  REQ(BlitFramebuffer, "glBlitFramebuffer")
-  REQ(InvalidateFramebuffer, "glInvalidateFramebuffer")
-  REQ(DrawBuffers, "glDrawBuffers")
-  REQ(ReadBuffer, "glReadBuffer")
+  OPT(BlitFramebuffer, "glBlitFramebuffer")
+  OPT(InvalidateFramebuffer, "glInvalidateFramebuffer")
+  if (gl.InvalidateFramebuffer == nullptr) OPT(InvalidateFramebuffer, "glDiscardFramebufferEXT")
+  OPT(DrawBuffers, "glDrawBuffers")
+  OPT(ReadBuffer, "glReadBuffer")
   REQ(ReadPixels, "glReadPixels")
   REQ(GenRenderbuffers, "glGenRenderbuffers")
   REQ(DeleteRenderbuffers, "glDeleteRenderbuffers")
@@ -132,10 +143,10 @@ bool load(ProcAddressFn getProc) {
   REQ(ClearDepthf, "glClearDepthf")
   REQ(ClearStencil, "glClearStencil")
   REQ(Clear, "glClear")
-  REQ(ClearBufferfv, "glClearBufferfv")
-  REQ(ClearBufferfi, "glClearBufferfi")
-  REQ(ClearBufferiv, "glClearBufferiv")
-  REQ(ClearBufferuiv, "glClearBufferuiv")
+  OPT(ClearBufferfv, "glClearBufferfv")
+  OPT(ClearBufferfi, "glClearBufferfi")
+  OPT(ClearBufferiv, "glClearBufferiv")
+  OPT(ClearBufferuiv, "glClearBufferuiv")
 
   // Shaders / programs
   REQ(CreateShader, "glCreateShader")
@@ -154,9 +165,10 @@ bool load(ProcAddressFn getProc) {
   REQ(DeleteProgram, "glDeleteProgram")
   REQ(GetUniformLocation, "glGetUniformLocation")
   REQ(Uniform1i, "glUniform1i")
-  REQ(GetUniformBlockIndex, "glGetUniformBlockIndex")
-  REQ(UniformBlockBinding, "glUniformBlockBinding")
-  REQ(GetActiveUniformBlockiv, "glGetActiveUniformBlockiv")
+  REQ(Uniform4fv, "glUniform4fv")
+  OPT(GetUniformBlockIndex, "glGetUniformBlockIndex")
+  OPT(UniformBlockBinding, "glUniformBlockBinding")
+  OPT(GetActiveUniformBlockiv, "glGetActiveUniformBlockiv")
   // Program binary (ES 3.0 core, but OPT: the binary cache degrades to source
   // compile when absent, and the ProgramParameteri hint is inert on drivers that
   // do not need it). glProgramBinary is the base spelling; some GLES stacks only
@@ -197,15 +209,15 @@ bool load(ProcAddressFn getProc) {
   OPT(DrawElementsInstanced, "glDrawElementsInstanced")
 
   // Sync / query
-  REQ(FenceSync, "glFenceSync")
-  REQ(ClientWaitSync, "glClientWaitSync")
-  REQ(WaitSync, "glWaitSync")
-  REQ(DeleteSync, "glDeleteSync")
+  OPT(FenceSync, "glFenceSync")
+  OPT(ClientWaitSync, "glClientWaitSync")
+  OPT(WaitSync, "glWaitSync")
+  OPT(DeleteSync, "glDeleteSync")
   REQ(Finish, "glFinish")
   REQ(Flush, "glFlush")
   REQ(GetError, "glGetError")
   REQ(GetString, "glGetString")
-  REQ(GetStringi, "glGetStringi")
+  OPT(GetStringi, "glGetStringi")
   REQ(GetIntegerv, "glGetIntegerv")
   REQ(GetFloatv, "glGetFloatv")
 

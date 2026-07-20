@@ -27,6 +27,17 @@ gl::ColorWriteMask clear_write_mask(bool clearColor, bool clearAlpha) {
 // so it is compiled once on the render worker (S2/S8: attribute-less, no z remap).
 gl::GLuint s_clearProgram = 0;
 
+#ifdef AURORA_GLES2
+constexpr char kVertexSource[] = R"(#version 100
+attribute vec2 a_position;
+void main() { gl_Position = vec4(a_position, 0.0, 1.0); }
+)";
+
+constexpr char kFragmentSource[] = R"(#version 100
+precision highp float;
+void main() { gl_FragColor = vec4(1.0); }
+)";
+#else
 constexpr char kVertexSource[] = R"(#version 300 es
 void main() {
   const vec2 positions[3] = vec2[3](vec2(-1.0, 1.0), vec2(-1.0, -3.0), vec2(3.0, 1.0));
@@ -39,6 +50,7 @@ precision highp float;
 out vec4 fragColor;
 void main() { fragColor = vec4(1.0); }
 )";
+#endif
 } // namespace
 
 // Called on the render worker during gfx::initialize (context current). Idempotent.
@@ -70,7 +82,12 @@ gl::Pipeline create_pipeline(const PipelineConfig& config) {
   return gl::Pipeline{
       .program = s_clearProgram,
       .state = state,
-      .vertexLayout = 0,
+      .vertexLayout =
+#ifdef AURORA_GLES2
+          gl::kFullscreenVertexLayout,
+#else
+          0,
+#endif
   };
 }
 

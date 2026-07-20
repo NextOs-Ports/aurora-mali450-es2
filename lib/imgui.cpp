@@ -65,7 +65,11 @@ void initialize() noexcept {
     // worker's context, so init there and force device-object creation (NewFrame lazily
     // builds them) before the first real frame renders on the worker.
     gfx::render_worker::enqueue_work([] {
+#ifdef AURORA_GLES2
+      ImGui_ImplOpenGL3_Init("#version 100");
+#else
       ImGui_ImplOpenGL3_Init("#version 300 es");
+#endif
       ImGui_ImplOpenGL3_NewFrame();
       gl::invalidate_texture_bindings();
     });

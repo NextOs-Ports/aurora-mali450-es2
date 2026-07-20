@@ -21,6 +21,7 @@
 #include "context.hpp"
 #include "fbo_cache.hpp"
 #include "gl_core.hpp"
+#include "pass.hpp"
 #include "program.hpp"
 #include "state.hpp"
 #include "textures.hpp"
@@ -36,6 +37,14 @@
 namespace aurora::webgpu {
 namespace {
 Module Log("aurora::gl");
+
+#ifdef AURORA_GLES2
+constexpr int kClientMajor = 2;
+constexpr int kClientMinor = 0;
+#else
+constexpr int kClientMajor = 3;
+constexpr int kClientMinor = 0;
+#endif
 
 SDL_Window* g_sdlWindow = nullptr;
 // The SDL_GL context created on the shim path to make the shim's sdl2 driver borrow and publish
@@ -55,8 +64,13 @@ bool has_gl_extension(const char* name) {
 void query_caps() {
   // Desktop ES 3.0 core: swizzle (GL_TEXTURE_SWIZZLE_*), sRGB, integer textures
   // and R16I are all guaranteed. Compressed formats and anisotropy are optional.
+#ifdef AURORA_GLES2
+  g_hasCoreFeatures = false;
+  g_textureComponentSwizzleSupported = false;
+#else
   g_hasCoreFeatures = true;
   g_textureComponentSwizzleSupported = true;
+#endif
   g_bcTexturesSupported = has_gl_extension("GL_EXT_texture_compression_s3tc");
   g_astcTexturesSupported = has_gl_extension("GL_KHR_texture_compression_astc_ldr") ||
                             has_gl_extension("GL_OES_texture_compression_astc");
@@ -78,9 +92,13 @@ void query_caps() {
   }
   g_graphicsConfig.textureAnisotropy = anisotropy;
 
+#ifdef AURORA_GLES2
+  g_uniformBufferOffsetAlignment = 16;
+#else
   gl::GLint uboAlign = 256;
   gl::gl.GetIntegerv(gl::GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &uboAlign);
   g_uniformBufferOffsetAlignment = uboAlign > 0 ? static_cast<uint32_t>(uboAlign) : 256u;
+#endif
 }
 } // namespace
 
@@ -140,8 +158,8 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
     SDL_PropertiesID props = SDL_GetWindowProperties(g_sdlWindow);
     if (SDL_GetPointerProperty(props, "SDL.window.sdl2_backend.egl_display", nullptr) == nullptr) {
       SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
-      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, kClientMajor);
+      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, kClientMinor);
       SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
       g_shimBootstrapCtx = SDL_GL_CreateContext(g_sdlWindow);
       if (g_shimBootstrapCtx == nullptr) {
@@ -188,7 +206,11 @@ bool initialize(AuroraBackend backend, bool allowCpu) {
   g_graphicsConfig.surfaceConfiguration.height = size.fb_height;
   g_presentWidth = size.native_fb_width;
   g_presentHeight = size.native_fb_height;
+#ifdef AURORA_GLES2
+  g_graphicsConfig.depthFormat = gl::TextureFormat::Depth24Plus;
+#else
   g_graphicsConfig.depthFormat = gl::TextureFormat::Depth32Float;
+#endif
   g_graphicsConfig.msaaSamples = 1;
 
   // Desktop: release the render context so the render worker can take ownership. Device: the main
@@ -427,6 +449,24 @@ uint32_t present_surface_height() noexcept {
 // content bottom), the same layout as the GX scene target. This composite therefore samples it
 // straight, exactly like the scene blit: uv(0,0) at NDC(-1,-1) (window bottom = texel row 0), so
 // both put memory row 0 at the content-rect bottom -> upright and mutually aligned.
+#ifdef AURORA_GLES2
+constexpr char kPresentUiVertex[] = R"(#version 100
+precision highp float;
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv = vec2(a_uv.x, 1.0 - a_uv.y);
+}
+)";
+constexpr char kPresentUiFragment[] = R"(#version 100
+precision highp float;
+uniform sampler2D tex;
+varying vec2 v_uv;
+void main() { gl_FragColor = texture2D(tex, v_uv); }
+)";
+#else
 constexpr char kPresentUiVertex[] = R"(#version 300 es
 out vec2 v_uv;
 void main() {
@@ -443,6 +483,7 @@ in vec2 v_uv;
 out vec4 out_color;
 void main() { out_color = texture(tex, v_uv); }
 )";
+#endif
 gl::GLuint g_presentUiProgram = 0;
 
 // Compile the present-UI program on demand (worker context current).
@@ -479,6 +520,24 @@ void present_frame(uint32_t targetFbo) noexcept {
   const uint32_t surfaceHeight = present_surface_height();
   if (source.texture.id != 0 && surfaceWidth > 0 && surfaceHeight > 0) {
     const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
+#ifdef AURORA_GLES2
+    const gl::GLuint program = present_ui_program();
+    if (program != 0) {
+      gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
+      gl::gl.Viewport(static_cast<gl::GLint>(viewport.left), static_cast<gl::GLint>(viewport.top),
+                      static_cast<gl::GLsizei>(viewport.width), static_cast<gl::GLsizei>(viewport.height));
+      gl::gl.Disable(gl::GL_BLEND);
+      gl::gl.UseProgram(program);
+      gl::gl.ActiveTexture(gl::GL_TEXTURE0);
+      gl::gl.BindTexture(gl::GL_TEXTURE_2D, source.texture.id);
+      gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MIN_FILTER, gl::GL_LINEAR);
+      gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_MAG_FILTER, gl::GL_LINEAR);
+      gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_S, gl::GL_CLAMP_TO_EDGE);
+      gl::gl.TexParameteri(gl::GL_TEXTURE_2D, gl::GL_TEXTURE_WRAP_T, gl::GL_CLAMP_TO_EDGE);
+      gl::bind_fullscreen_triangle();
+      gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
+    }
+#else
     const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
     gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
     gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, targetFbo);
@@ -489,6 +548,7 @@ void present_frame(uint32_t targetFbo) noexcept {
     gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(source.size.width), static_cast<gl::GLint>(source.size.height),
                            dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
     gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
+#endif
   }
 }
 
@@ -524,10 +584,17 @@ void composite_ui_overlay(const gl::Texture& texture, const gl::Sampler& sampler
   gl::gl.UseProgram(program);
   gl::gl.ActiveTexture(gl::GL_TEXTURE0);
   gl::gl.BindTexture(gl::GL_TEXTURE_2D, texture.id);
+#ifdef AURORA_GLES2
+  gl::apply_sampler_to_bound_texture(texture.id, sampler.id);
+  gl::bind_fullscreen_triangle();
+#else
   gl::gl.BindSampler(0, sampler.id);
   gl::gl.BindVertexArray(0);
+#endif
   gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
+#ifndef AURORA_GLES2
   gl::gl.BindSampler(0, 0);
+#endif
   gl::gl.Disable(gl::GL_BLEND);
 }
 
@@ -536,6 +603,29 @@ void present_swap() noexcept {
   // shadow so the next frame's first pass re-issues everything.
   gl::reset_state_cache();
   if (g_sdlWindow != nullptr) {
+#ifdef AURORA_GLES2
+    // Amlogic-old's fbdev OSD composites fb0 using its pixel alpha. GX and UI
+    // passes are allowed to leave transparent alpha in the backbuffer, which
+    // would make otherwise-correct RGB scan out as black. Preserve RGB and
+    // normalize only alpha immediately before swap.
+    gl::GLint scissorEnabled = 0;
+    gl::GLint colorMask[4] = {gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE};
+    gl::GLfloat clearColor[4] = {0.f, 0.f, 0.f, 0.f};
+    gl::gl.GetIntegerv(gl::GL_SCISSOR_TEST, &scissorEnabled);
+    gl::gl.GetIntegerv(0x0C23 /* GL_COLOR_WRITEMASK */, colorMask);
+    gl::gl.GetFloatv(0x0C22 /* GL_COLOR_CLEAR_VALUE */, clearColor);
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+    gl::gl.Disable(gl::GL_SCISSOR_TEST);
+    gl::gl.ColorMask(gl::GL_FALSE, gl::GL_FALSE, gl::GL_FALSE, gl::GL_TRUE);
+    gl::gl.ClearColor(0.f, 0.f, 0.f, 1.f);
+    gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
+    gl::gl.ColorMask(static_cast<gl::GLboolean>(colorMask[0]), static_cast<gl::GLboolean>(colorMask[1]),
+                     static_cast<gl::GLboolean>(colorMask[2]), static_cast<gl::GLboolean>(colorMask[3]));
+    gl::gl.ClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+    if (scissorEnabled != 0) {
+      gl::gl.Enable(gl::GL_SCISSOR_TEST);
+    }
+#endif
     SDL_GL_SwapWindow(g_sdlWindow);
   }
 }

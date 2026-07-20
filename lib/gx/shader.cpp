@@ -11,9 +11,12 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "tracy/Tracy.hpp"
 
@@ -55,7 +58,15 @@ static bool is_alpha_bump_channel(GXChannelID id) noexcept { return id == GX_ALP
 
 static std::string tev_mask_expr(const std::string& value, u32 mask) {
   // t_IndTexCoord is already expanded into the 0..255 indirect sample domain.
+#ifdef AURORA_GLES2
+  u32 quantum = 1;
+  while ((mask & quantum) == 0u) {
+    quantum <<= 1;
+  }
+  return fmt::format("(floor({0} / {1}.0) * {1}.0 / 255.0)", value, quantum);
+#else
   return fmt::format("(f32(u32({}) & 0x{:X}u) / 255.0)", value, mask);
+#endif
 }
 
 static std::string alpha_bump_sel(size_t stageIdx, const ShaderConfig& config, const TevStage& stage) {
@@ -501,26 +512,62 @@ static AlphaCompareExpr alpha_compare(GXCompare comp, u8 ref) {
     if (ref == 0) {
       return alpha_compare_const(false);
     }
-    return {fmt::format("(alphaCompare < {}u)", iref), -1};
+    return {fmt::format("(alphaCompare < {}{})", iref,
+#ifdef AURORA_GLES2
+                        ".0"
+#else
+                        "u"
+#endif
+                        ), -1};
   case GX_LEQUAL:
     if (ref == 255) {
       return alpha_compare_const(true);
     }
-    return {fmt::format("(alphaCompare <= {}u)", iref), -1};
+    return {fmt::format("(alphaCompare <= {}{})", iref,
+#ifdef AURORA_GLES2
+                        ".0"
+#else
+                        "u"
+#endif
+                        ), -1};
   case GX_EQUAL:
-    return {fmt::format("(alphaCompare == {}u)", iref), -1};
+    return {fmt::format("(alphaCompare == {}{})", iref,
+#ifdef AURORA_GLES2
+                        ".0"
+#else
+                        "u"
+#endif
+                        ), -1};
   case GX_NEQUAL:
-    return {fmt::format("(alphaCompare != {}u)", iref), -1};
+    return {fmt::format("(alphaCompare != {}{})", iref,
+#ifdef AURORA_GLES2
+                        ".0"
+#else
+                        "u"
+#endif
+                        ), -1};
   case GX_GEQUAL:
     if (ref == 0) {
       return alpha_compare_const(true);
     }
-    return {fmt::format("(alphaCompare >= {}u)", iref), -1};
+    return {fmt::format("(alphaCompare >= {}{})", iref,
+#ifdef AURORA_GLES2
+                        ".0"
+#else
+                        "u"
+#endif
+                        ), -1};
   case GX_GREATER:
     if (ref == 255) {
       return alpha_compare_const(false);
     }
-    return {fmt::format("(alphaCompare > {}u)", iref), -1};
+    return {fmt::format("(alphaCompare > {}{})", iref,
+#ifdef AURORA_GLES2
+                        ".0"
+#else
+                        "u"
+#endif
+                        ), -1};
   case GX_ALWAYS:
     return alpha_compare_const(true);
   }
@@ -544,7 +591,11 @@ static inline std::string vtx_attr(const ShaderConfig& config, GXAttr attr) {
   const auto type = config.attrs[attr].attrType;
   if (type == GX_NONE) {
     if (attr == GX_VA_PNMTXIDX) {
+#ifdef AURORA_GLES2
+      return "u_data[0].y";
+#else
       return "ubuf.current_pnmtx";
+#endif
     }
     if (attr == GX_VA_NRM) {
       // Default normal
@@ -808,6 +859,30 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   } else if (diffFn == GX_DF_CLAMP) {
     lightDiffFn = "max(0.0, dot(ldir, mv_nrm))"sv;
   }
+#ifdef AURORA_GLES2
+  std::string lightSteps;
+  const auto maskName = fmt::format("ubuf.lightState{}{}", i, alpha ? "a"sv : ""sv);
+  for (u32 li = 0; li < GX::MaxLights; ++li) {
+    lightSteps += fmt::format(R"""(
+      if (mod(floor({0} / {1}.0), 2.0) >= 1.0) {{
+          Light light = raw_light{2}();
+          vec3 ldir = light.pos - {3};
+          float dist2 = dot(ldir, ldir);
+          float dist = sqrt(dist2);
+          ldir = ldir / dist;
+          float attn;{4}
+          float diff = {5};
+          lighting = lighting + (attn * diff * light.color);
+      }})""",
+                              maskName, 1u << li, li, posVar, lightAttnFn, lightDiffFn);
+  }
+  return fmt::format(R"""(
+    {{
+      vec4 lighting = {0};{1}
+      {2}{3} = ({4} * clamp(lighting, vec4(0.0), vec4(1.0))){3};
+    }})""",
+                     ambSrc, lightSteps, outVar, swizzle, matSrc);
+#else
   return fmt::format(R"""(
     {{
       vec4 lighting = {5};
@@ -826,9 +901,32 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     }})""",
                      i, GX::MaxLights, lightAttnFn, lightDiffFn, matSrc, ambSrc, posVar, outVar, swizzle,
                      alpha ? "a"sv : ""sv);
+#endif
 }
 
 namespace {
+void replace_all(std::string& text, std::string_view from, std::string_view to) {
+  std::string::size_type pos = 0;
+  while ((pos = text.find(from, pos)) != std::string::npos) {
+    text.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+}
+
+void replace_function_name(std::string& text, std::string_view from, std::string_view to) {
+  std::string::size_type pos = 0;
+  while ((pos = text.find(from, pos)) != std::string::npos) {
+    const bool partOfIdentifier = pos != 0 &&
+                                  (std::isalnum(static_cast<unsigned char>(text[pos - 1])) || text[pos - 1] == '_');
+    if (!partOfIdentifier) {
+      text.replace(pos, from.size(), to);
+      pos += to.size();
+    } else {
+      pos += from.size();
+    }
+  }
+}
+
 // Final WGSL->GLSL vocabulary pass over an assembled shader body. The structural
 // pieces (uniform block, varyings, vertex inputs, `let`/`var` decls, select, %,
 // textureSampleBias, out./in.) are already GLSL by the time we get here; this only
@@ -842,11 +940,7 @@ void glslify_vocab(std::string& s) {
       {"vec4i(", "ivec4("}, {"f32(", "float("},   {"u32(", "uint("},    {"i32(", "int("},
   };
   for (const auto& [from, to] : kSubs) {
-    std::string::size_type pos = 0;
-    while ((pos = s.find(from, pos)) != std::string::npos) {
-      s.replace(pos, from.size(), to);
-      pos += to.size();
-    }
+    replace_all(s, from, to);
   }
 }
 
@@ -873,10 +967,112 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   std::string vsBody;
   std::string fsPre;
   std::string fsBody;
+  std::string rawHelpers;
+
+#ifdef AURORA_GLES2
+  std::vector<std::pair<std::string, std::string>> rawReplacements;
+  const auto raw = [](u32 index) { return fmt::format("u_data[{}]", index); };
+  rawReplacements.emplace_back("ubuf.vtx_start", "u_data[0].x");
+  rawReplacements.emplace_back("ubuf.current_pnmtx", "u_data[0].y");
+  rawReplacements.emplace_back("ubuf.render_viewport_size", "u_data[0].zw");
+  rawReplacements.emplace_back("ubuf.logical_viewport_size", "u_data[1].xy");
+  for (u32 i = 0; i < 3; ++i) {
+    rawReplacements.emplace_back(fmt::format("ubuf.array_start[{}]", i), fmt::format("u_data[{}]", 2 + i));
+  }
+
+  u32 rawCursor = 5 + (info.lineMode != 0 ? 1u : 0u);
+  const u32 rawProj = rawCursor;
+  rawCursor += 4;
+  const u32 rawPostex = rawCursor;
+  rawCursor += (MaxPnMtx + MaxTexMtx) * 3;
+  const u32 rawNrm = rawCursor;
+  if (info.usesNormals) {
+    rawCursor += MaxPnMtx * 3;
+  }
+  for (u32 i = 0; i < info.loadsTevReg.size(); ++i) {
+    if (info.loadsTevReg.test(i)) {
+      rawReplacements.emplace_back(i == 0 ? "ubuf.tevprev" : fmt::format("ubuf.tevreg{}", i - 1), raw(rawCursor++));
+    }
+  }
+
+  u32 rawLights = 0;
+  if (info.lightingEnabled) {
+    rawLights = rawCursor;
+    rawCursor += GX::MaxLights * 5;
+    rawReplacements.emplace_back("ubuf.lightState0", raw(rawCursor) + ".x");
+    rawReplacements.emplace_back("ubuf.lightState1", raw(rawCursor) + ".y");
+    rawReplacements.emplace_back("ubuf.lightState0a", raw(rawCursor) + ".z");
+    rawReplacements.emplace_back("ubuf.lightState1a", raw(rawCursor) + ".w");
+    ++rawCursor;
+    for (u32 i = 0; i < GX::MaxLights; ++i) {
+      const u32 base = rawLights + i * 5;
+      rawReplacements.emplace_back(fmt::format("ubuf.lights[{}].pos", i), raw(base) + ".xyz");
+      rawReplacements.emplace_back(fmt::format("ubuf.lights[{}].dir", i), raw(base + 1) + ".xyz");
+      rawReplacements.emplace_back(fmt::format("ubuf.lights[{}].color", i), raw(base + 2));
+      rawReplacements.emplace_back(fmt::format("ubuf.lights[{}].cos_att", i), raw(base + 3) + ".xyz");
+      rawReplacements.emplace_back(fmt::format("ubuf.lights[{}].dist_att", i), raw(base + 4) + ".xyz");
+    }
+  }
+  for (u32 i = 0; i < info.sampledColorChannels.size(); ++i) {
+    if (!info.sampledColorChannels.test(i)) {
+      continue;
+    }
+    const auto& cc = config.colorChannels[i];
+    const auto& cca = config.colorChannels[i + GX_ALPHA0];
+    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
+      rawReplacements.emplace_back(fmt::format("ubuf.cc{}_amb", i), raw(rawCursor++));
+    }
+    if (cc.matSrc == GX_SRC_REG) {
+      rawReplacements.emplace_back(fmt::format("ubuf.cc{}_mat", i), raw(rawCursor++));
+    }
+    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
+      rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_amb", i), raw(rawCursor++));
+    }
+    if (cca.matSrc == GX_SRC_REG) {
+      rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_mat", i), raw(rawCursor++));
+    }
+  }
+  for (u32 i = 0; i < info.sampledKColors.size(); ++i) {
+    if (info.sampledKColors.test(i)) {
+      rawReplacements.emplace_back(fmt::format("ubuf.kcolor{}", i), raw(rawCursor++));
+    }
+  }
+  const u32 rawPostmtx = rawCursor;
+  if (info.usesPTTexMtx.any()) {
+    rawCursor += MaxPTTexMtx * 3;
+  }
+  if (info.usesFog) {
+    rawReplacements.emplace_back("ubuf.fog.color", raw(rawCursor));
+    rawReplacements.emplace_back("ubuf.fog.a", raw(rawCursor + 1) + ".x");
+    rawReplacements.emplace_back("ubuf.fog.b", raw(rawCursor + 1) + ".y");
+    rawReplacements.emplace_back("ubuf.fog.c", raw(rawCursor + 1) + ".z");
+    rawCursor += 2;
+  }
+  for (u32 i = 0; i < MaxTexCoord; ++i) {
+    rawReplacements.emplace_back(fmt::format("ubuf.texcoord_scale[{}]", i), raw(rawCursor++));
+  }
+  if (info.usedIndTexMtxs.any()) {
+    for (u32 i = 0; i < MaxIndTexMtxs; ++i) {
+      rawReplacements.emplace_back(fmt::format("ubuf.ind_mtx[{}][0]", i), raw(rawCursor++));
+      rawReplacements.emplace_back(fmt::format("ubuf.ind_mtx[{}][1]", i), raw(rawCursor++));
+    }
+  }
+  for (u32 i = 0; i < info.sampledTextures.size(); ++i) {
+    if (info.sampledTextures.test(i)) {
+      rawReplacements.emplace_back(fmt::format("ubuf.tex{}_size_bias", i), raw(rawCursor++));
+    }
+  }
+  const u32 rawUniformVec4Count = std::max(rawCursor, info.uniformSize / 16u);
+#endif
 
   const auto addVarying = [&](std::string_view type, const std::string& name) {
+#ifdef AURORA_GLES2
+    varyingsOut += fmt::format("\nvarying {} {};", type, name);
+    varyingsIn += fmt::format("\nvarying {} {};", type, name);
+#else
     varyingsOut += fmt::format("\nout {} {};", type, name);
     varyingsIn += fmt::format("\nin {} {};", type, name);
+#endif
   };
 
   // Native inputs: one packed `layout(location = N) in` per present attr, in canonical
@@ -889,11 +1085,23 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       if (config.attrs[attr].attrType == GX_NONE) {
         return;
       }
+#ifdef AURORA_GLES2
+      vertexInputs += fmt::format("\nattribute {} {};", type, vtx_attr(config, attr));
+#else
       vertexInputs += fmt::format("\nlayout(location = {}) in {} {};", location++, type, vtx_attr(config, attr));
+#endif
     };
+#ifdef AURORA_GLES2
+    addInput(GX_VA_PNMTXIDX, "float");
+#else
     addInput(GX_VA_PNMTXIDX, "uint");
+#endif
     for (GXAttr attr = GX_VA_TEX0MTXIDX; attr <= GX_VA_TEX7MTXIDX; attr = static_cast<GXAttr>(attr + 1)) {
+#ifdef AURORA_GLES2
+      addInput(attr, "float");
+#else
       addInput(attr, "uint");
+#endif
     }
     addInput(GX_VA_POS, "vec3");
     addInput(GX_VA_NRM, "vec3");
@@ -906,12 +1114,23 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
 
   // ---- Vertex transform ----
   if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
+#ifdef AURORA_GLES2
+    vsBody += "\n    float in_pnmtxidx = u_data[0].y;";
+#else
     vsBody += "\n    uint in_pnmtxidx = ubuf.current_pnmtx;";
+#endif
   }
+#ifdef AURORA_GLES2
+  vsBody += fmt::format(
+      "\n    vec3 mv_pos = raw_mul3x4(vec4({0}, 1.0), {1} + int(in_pnmtxidx) * 3);"
+      "\n    gl_Position = vec4(mv_pos, 1.0) * raw_mat4({2});",
+      vtx_attr(config, GX_VA_POS), rawPostex, rawProj);
+#else
   vsBody += fmt::format(
       "\n    vec3 mv_pos = vec4({0}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
       "\n    gl_Position = vec4(mv_pos, 1.0) * ubuf.proj;",
       vtx_attr(config, GX_VA_POS));
+#endif
   // Reversed-Z (matches the depth compare/range/clear flips), then the GL clip-space
   // remap (S2): WebGPU clips z in [0,w], GL in [-w,w]. window depth stays bit-identical.
   if constexpr (UseReversedZ) {
@@ -921,10 +1140,17 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   }
   vsBody += "\n    gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;";
   if (info.usesNormals) {
+#ifdef AURORA_GLES2
+    vsBody += fmt::format(
+        "\n    vec3 nrm_tmp = raw_mul3x4(vec4({0}, 0.0), {1} + int(in_pnmtxidx) * 3);"
+        "\n    vec3 mv_nrm = (dot(nrm_tmp, nrm_tmp) > 1e-10) ? normalize(nrm_tmp) : nrm_tmp;",
+        vtx_attr(config, GX_VA_NRM), rawNrm);
+#else
     vsBody += fmt::format(
         "\n    vec3 nrm_tmp = vec4({0}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
         "\n    vec3 mv_nrm = (dot(nrm_tmp, nrm_tmp) > 1e-10) ? normalize(nrm_tmp) : nrm_tmp;",
         vtx_attr(config, GX_VA_NRM));
+#endif
   }
 
   uniformFields += "\n    mat4 proj;";
@@ -995,6 +1221,22 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
         "    vec3 cos_att;\n"
         "    vec3 dist_att;\n"
         "};\n";
+#ifdef AURORA_GLES2
+    for (u32 i = 0; i < GX::MaxLights; ++i) {
+      const u32 base = rawLights + i * 5;
+      rawHelpers += fmt::format(
+          "\nLight raw_light{0}() {{\n"
+          "  Light l;\n"
+          "  l.pos = u_data[{1}].xyz;\n"
+          "  l.dir = u_data[{2}].xyz;\n"
+          "  l.color = u_data[{3}];\n"
+          "  l.cos_att = u_data[{4}].xyz;\n"
+          "  l.dist_att = u_data[{5}].xyz;\n"
+          "  return l;\n"
+          "}}\n",
+          i, base, base + 1, base + 2, base + 3, base + 4);
+    }
+#endif
   }
 
   // ---- Color channels (raster colors) ----
@@ -1040,12 +1282,21 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     if (is_emboss_texgen(tcg.type)) {
       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
+#ifdef AURORA_GLES2
+      vsBody += fmt::format(
+          "\n    vec3 bump_ldir{0} = normalize(u_data[{1}].xyz - mv_pos);"
+          "\n    vec3 bump_tan{0} = raw_mul3x4(vec4(in_tangent, 0.0), {2} + int(in_pnmtxidx) * 3);"
+          "\n    vec3 bump_bin{0} = raw_mul3x4(vec4(in_binrm, 0.0), {2} + int(in_pnmtxidx) * 3);"
+          "\n    v_tex{0}_uv = tc{3}_proj.xy + vec2(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, bump_bin{0}));",
+          i, rawLights + lightIdx * 5, rawNrm, tcg.embossSrc);
+#else
       vsBody += fmt::format(
           "\n    vec3 bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
           "\n    vec3 bump_tan{0} = vec4(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
           "\n    vec3 bump_bin{0} = vec4(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
           "\n    v_tex{0}_uv = tc{2}_proj.xy + vec2(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, bump_bin{0}));",
           i, lightIdx, tcg.embossSrc);
+#endif
       fsPre += fmt::format("\n    vec2 tex{0}_uv = v_tex{0}_uv.xy;", i);
       continue;
     }
@@ -1068,12 +1319,21 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+#ifdef AURORA_GLES2
+        vsBody += fmt::format("\n    vec3 tc{0}_tmp = raw_mul3x4(tc{0}, {1} + int(in_texmtxidx{0} / 3.0) * 3);", i,
+                              rawPostex);
+#else
         vsBody += fmt::format("\n    vec3 tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
+#endif
       } else if (tcg.mtx == GX_IDENTITY) {
         vsBody += fmt::format("\n    vec3 tc{0}_tmp = tc{0}.xyz;", i);
       } else {
         u32 texMtxIdx = (tcg.mtx) / 3;
+#ifdef AURORA_GLES2
+        vsBody += fmt::format("\n    vec3 tc{0}_tmp = raw_mul3x4(tc{0}, {1});", i, rawPostex + texMtxIdx * 3);
+#else
         vsBody += fmt::format("\n    vec3 tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
+#endif
       }
       if (tcg.type == GX_TG_MTX2x4) {
         vsBody += fmt::format("\n    tc{0}_tmp.z = 1.0;", i);
@@ -1088,7 +1348,12 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       vsBody += fmt::format("\n    vec3 tc{0}_proj = tc{0}_tmp;", i);
     } else {
       u32 postMtxIdx = (tcg.postMtx - GX_PTTEXMTX0) / 3;
+#ifdef AURORA_GLES2
+      vsBody += fmt::format("\n    vec3 tc{0}_proj = raw_mul3x4(vec4(tc{0}_tmp.xyz, 1.0), {1});", i,
+                            rawPostmtx + postMtxIdx * 3);
+#else
       vsBody += fmt::format("\n    vec3 tc{0}_proj = vec4(tc{0}_tmp.xyz, 1.0) * ubuf.postmtx[{1}];", i, postMtxIdx);
+#endif
     }
     if (tcg.type == GX_TG_MTX3x4) {
       vsBody += fmt::format("\n    v_tex{0}_uvw = tc{0}_proj.xyz;", i);
@@ -1380,17 +1645,27 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     if (discard.constant == 1) {
       fsBody += "\n    // Alpha compare\n    discard;";
     } else if (discard.constant != 0) {
+#ifdef AURORA_GLES2
+      fsBody +=
+          "\n    // Alpha compare"
+          "\n    float alphaCompare = floor(clamp(prev.a, 0.0, 1.0) * 255.0 + 0.5);";
+#else
       fsBody +=
           "\n    // Alpha compare"
           "\n    uint alphaCompare = uint(round(clamp(prev.a, 0.0, 1.0) * 255.0));";
+#endif
       fsBody += fmt::format("\n    if ({}) {{ discard; }}", discard.expr);
     }
   }
 
-  // ---- Assemble the two `#version 300 es` sources ----
+  // ---- Assemble the stage sources ----
   // precision highp is mandatory: TEV's integer-compare reconstruction needs fp32
   // (mediump is fp16 on PowerVR and would corrupt it).
+#ifdef AURORA_GLES2
+  static constexpr std::string_view kHeader = "#version 100\nprecision highp float;\nprecision highp int;\n";
+#else
   static constexpr std::string_view kHeader = "#version 300 es\nprecision highp float;\nprecision highp int;\n";
+#endif
   static constexpr std::string_view kOverflow =
       "\nfloat tev_overflow_f32(float v) {\n"
       "  float byte_space = v * 255.0;\n"
@@ -1403,8 +1678,26 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       "vec4 tev_overflow_vec4f(vec4 v) {\n"
       "  vec4 byte_space = v * 255.0;\n"
       "  return (byte_space - floor(byte_space / 256.0) * 256.0) / 255.0;\n"
-      "}\n";
+      "}\n"
+#ifdef AURORA_GLES2
+      "float gx_round(float v) { return floor(v + 0.5); }\n"
+      "vec2 gx_round(vec2 v) { return floor(v + vec2(0.5)); }\n"
+      "vec3 gx_round(vec3 v) { return floor(v + vec3(0.5)); }\n"
+      "vec4 gx_round(vec4 v) { return floor(v + vec4(0.5)); }\n"
+#endif
+      ;
 
+#ifdef AURORA_GLES2
+  std::string uniformBlock = fmt::format("\nuniform vec4 u_data[{}];\n", rawUniformVec4Count);
+  rawHelpers =
+      "\nvec3 raw_mul3x4(vec4 v, int base) {\n"
+      "  return vec3(dot(v, u_data[base]), dot(v, u_data[base + 1]), dot(v, u_data[base + 2]));\n"
+      "}\n"
+      "mat4 raw_mat4(int base) {\n"
+      "  return mat4(u_data[base], u_data[base + 1], u_data[base + 2], u_data[base + 3]);\n"
+      "}\n" +
+      rawHelpers;
+#else
   std::string uniformBlock = fmt::format(
       "\nlayout(std140) uniform Uniform {{"
       "\n    uint vtx_start;"
@@ -1415,14 +1708,31 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       "\n    uvec4 array_start[3];{}"
       "\n}} ubuf;\n",
       uniformFields);
+#endif
 
   GlslProgram out;
-  out.vertex = std::string(kHeader) + structDefs + uniformBlock + vertexInputs + varyingsOut +
+  out.vertex = std::string(kHeader) + structDefs + uniformBlock + rawHelpers + vertexInputs + varyingsOut +
                "\n\nvoid main() {" + vsBody + "\n}\n";
-  out.fragment = std::string(kHeader) + std::string(kOverflow) + structDefs + uniformBlock + samplerDecls + varyingsIn +
+  out.fragment = std::string(kHeader) + std::string(kOverflow) + structDefs + uniformBlock + rawHelpers + samplerDecls +
+                 varyingsIn +
+#ifdef AURORA_GLES2
+                 "\n\nvoid main() {" + fsPre + fsBody + "\n    gl_FragColor = prev;\n}\n";
+#else
                  "\n\nout vec4 out_color;\n\nvoid main() {" + fsPre + fsBody + "\n    out_color = prev;\n}\n";
+#endif
   glslify_vocab(out.vertex);
   glslify_vocab(out.fragment);
+#ifdef AURORA_GLES2
+  std::sort(rawReplacements.begin(), rawReplacements.end(), [](const auto& a, const auto& b) {
+    return a.first.size() > b.first.size();
+  });
+  for (const auto& [from, to] : rawReplacements) {
+    replace_all(out.vertex, from, to);
+    replace_all(out.fragment, from, to);
+  }
+  replace_all(out.fragment, "texture(", "texture2D(");
+  replace_function_name(out.fragment, "round(", "gx_round(");
+#endif
   return out;
 }
 } // namespace

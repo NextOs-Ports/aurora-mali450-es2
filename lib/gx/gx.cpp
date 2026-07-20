@@ -13,6 +13,7 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <absl/container/flat_hash_set.h>
+#include <absl/base/casts.h>
 #include <tracy/Tracy.hpp>
 
 #include <atomic>
@@ -619,8 +620,9 @@ static inline gfx::CullMode to_cull_mode(GXCullMode gx_cullMode) {
 // FrontFace stays in WebGPU terms (CW) and the S1a winding flip happens once there.
 gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, const char* label) noexcept {
   ZoneScoped;
-  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetBits);
-  const float depthBiasSlopeScale = (UseReversedZ ? -1.0f : 1.0f) * std::bit_cast<float>(config.polygonOffsetScaleBits);
+  const float depthBias = (UseReversedZ ? -1.0f : 1.0f) * absl::bit_cast<float>(config.polygonOffsetBits);
+  const float depthBiasSlopeScale =
+      (UseReversedZ ? -1.0f : 1.0f) * absl::bit_cast<float>(config.polygonOffsetScaleBits);
 
   const auto blend = to_blend_state(config.blendMode, config.blendFacSrc, config.blendFacDst, config.blendOp,
                                     config.dstAlpha);
@@ -649,8 +651,17 @@ gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, cons
 
   // TriangleStrip batches separate strips with the max Uint16 index (0xffff) as an
   // implicit primitive restart; a triangle *list* must NOT enable restart (S6).
-  state.topology =
-      config.triangleStripTopology != 0 ? gfx::PrimitiveTopology::TriangleStrip : gfx::PrimitiveTopology::TriangleList;
+  if (config.triangleStripTopology != 0) {
+    state.topology = gfx::PrimitiveTopology::TriangleStrip;
+  } else if (config.nativeRasterTopology == 1) {
+    state.topology = gfx::PrimitiveTopology::LineList;
+  } else if (config.nativeRasterTopology == 2) {
+    state.topology = gfx::PrimitiveTopology::LineStrip;
+  } else if (config.nativeRasterTopology == 3) {
+    state.topology = gfx::PrimitiveTopology::PointList;
+  } else {
+    state.topology = gfx::PrimitiveTopology::TriangleList;
+  }
   state.primitiveRestart = config.triangleStripTopology != 0;
 
   // Native vertex layout as a present-attr bitmask over canonical GX attr order
@@ -764,9 +775,9 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .blendFacDst = g_gxState.blendFacDst,
       .blendOp = g_gxState.blendOp,
       .dstAlpha = g_gxState.dstAlpha,
-      .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
-      .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
-      .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
+      .polygonOffsetBits = absl::bit_cast<uint32_t>(polygonOffset),
+      .polygonOffsetScaleBits = absl::bit_cast<uint32_t>(polygonOffsetScale),
+      .polygonOffsetClampBits = absl::bit_cast<uint32_t>(g_gxState.clamp),
       .depthCompare = g_gxState.depthCompare,
       .depthUpdate = g_gxState.depthUpdate,
       .alphaUpdate = g_gxState.alphaUpdate,

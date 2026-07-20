@@ -59,6 +59,189 @@ constexpr uint64_t ExtraUniformBindingSize =
 // repeated verbatim in every stage that references it (GLSL ES requires the vertex and
 // fragment declarations of a shared block to match exactly).
 
+#ifdef AURORA_GLES2
+constexpr std::string_view vertexSource = R"(#version 100
+precision highp float;
+uniform vec4 u_common[6];
+attribute vec2 in_position;
+attribute vec2 in_uv;
+attribute vec4 in_color;
+varying vec4 v_color;
+varying vec2 v_uv;
+void main() {
+  mat4 mvp = mat4(u_common[0], u_common[1], u_common[2], u_common[3]);
+  vec2 translated_pos = u_common[4].xy + in_position;
+  gl_Position = mvp * vec4(translated_pos, 0.0, 1.0);
+  v_color = in_color;
+  v_uv = in_uv;
+}
+)"sv;
+
+constexpr std::string_view fragmentSource = R"(#version 100
+precision highp float;
+uniform vec4 u_common[6];
+uniform sampler2D t;
+varying vec4 v_color;
+varying vec2 v_uv;
+void main() {
+  vec4 color = v_color * texture2D(t, v_uv);
+  float gamma_value = u_common[5].x;
+  gl_FragColor = gamma_value == 1.0 ? color : vec4(pow(color.rgb, vec3(gamma_value)), color.a);
+}
+)"sv;
+
+constexpr std::string_view gradientFragmentSource = R"(#version 100
+precision highp float;
+precision highp int;
+uniform vec4 u_common[6];
+uniform vec4 u_extra[22];
+varying vec4 v_color;
+varying vec2 v_uv;
+const float PI = 3.14159265;
+
+float stop_position(int i) {
+  if (i == 0) return u_extra[18].x; if (i == 1) return u_extra[18].y;
+  if (i == 2) return u_extra[18].z; if (i == 3) return u_extra[18].w;
+  if (i == 4) return u_extra[19].x; if (i == 5) return u_extra[19].y;
+  if (i == 6) return u_extra[19].z; if (i == 7) return u_extra[19].w;
+  if (i == 8) return u_extra[20].x; if (i == 9) return u_extra[20].y;
+  if (i == 10) return u_extra[20].z; if (i == 11) return u_extra[20].w;
+  if (i == 12) return u_extra[21].x; if (i == 13) return u_extra[21].y;
+  if (i == 14) return u_extra[21].z; return u_extra[21].w;
+}
+vec4 stop_color(int i) {
+  if (i == 0) return u_extra[2]; if (i == 1) return u_extra[3];
+  if (i == 2) return u_extra[4]; if (i == 3) return u_extra[5];
+  if (i == 4) return u_extra[6]; if (i == 5) return u_extra[7];
+  if (i == 6) return u_extra[8]; if (i == 7) return u_extra[9];
+  if (i == 8) return u_extra[10]; if (i == 9) return u_extra[11];
+  if (i == 10) return u_extra[12]; if (i == 11) return u_extra[13];
+  if (i == 12) return u_extra[14]; if (i == 13) return u_extra[15];
+  if (i == 14) return u_extra[16]; return u_extra[17];
+}
+vec4 stop_color_mix(float value, float num_stops) {
+  vec4 color = stop_color(0);
+  for (int i = 1; i < 16; ++i) {
+    if (float(i) < num_stops) {
+      color = mix(color, stop_color(i), smoothstep(stop_position(i - 1), stop_position(i), value));
+    }
+  }
+  return color;
+}
+float bayer_dither(vec2 position) {
+  return (fract(sin(dot(floor(position), vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
+}
+void main() {
+  float function_id = u_extra[0].x;
+  float num_stops = u_extra[0].y;
+  vec2 p = u_extra[0].zw;
+  vec2 v = u_extra[1].xy;
+  float value = 0.0;
+  if (function_id == 0.0 || function_id == 3.0) {
+    value = dot(v, v_uv - p) / dot(v, v);
+  } else if (function_id == 1.0 || function_id == 4.0) {
+    value = length(v * (v_uv - p));
+  } else {
+    vec2 d = v_uv - p;
+    vec2 rotated = vec2(v.x * d.x + v.y * d.y, -v.y * d.x + v.x * d.y);
+    value = 0.5 + atan(-rotated.x, rotated.y) / (2.0 * PI);
+  }
+  if (function_id >= 3.0) {
+    float p0 = stop_position(0);
+    float p1 = stop_position(int(num_stops) - 1);
+    float span = p1 - p0;
+    value = p0 + (value - p0) - span * floor((value - p0) / span);
+  }
+  vec4 color = v_color * stop_color_mix(value, num_stops);
+  float gamma_value = u_common[5].x;
+  if (gamma_value != 1.0) {
+    color.rgb = clamp(pow(color.rgb, vec3(gamma_value)) + vec3(bayer_dither(gl_FragCoord.xy)), 0.0, 1.0);
+  }
+  gl_FragColor = color;
+}
+)"sv;
+
+constexpr std::string_view fullscreenVertexSource = R"(#version 100
+precision highp float;
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv;
+void main() {
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv = vec2(a_uv.x, 1.0 - a_uv.y);
+}
+)"sv;
+
+constexpr std::string_view blurVertexSource = R"(#version 100
+precision highp float;
+uniform vec4 u_extra[22];
+attribute vec2 a_position;
+attribute vec2 a_uv;
+varying vec2 v_uv0; varying vec2 v_uv1; varying vec2 v_uv2; varying vec2 v_uv3;
+varying vec2 v_uv4; varying vec2 v_uv5; varying vec2 v_uv6;
+vec2 blur_uv(vec2 uv, float index) { return uv - (index - 3.0) * u_extra[0].xy; }
+void main() {
+  vec2 uv = vec2(a_uv.x, 1.0 - a_uv.y);
+  gl_Position = vec4(a_position, 0.0, 1.0);
+  v_uv0 = blur_uv(uv, 0.0); v_uv1 = blur_uv(uv, 1.0); v_uv2 = blur_uv(uv, 2.0);
+  v_uv3 = blur_uv(uv, 3.0); v_uv4 = blur_uv(uv, 4.0); v_uv5 = blur_uv(uv, 5.0);
+  v_uv6 = blur_uv(uv, 6.0);
+}
+)"sv;
+
+constexpr std::string_view blitFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; varying vec2 v_uv;
+void main() { gl_FragColor = texture2D(t, v_uv); }
+)"sv;
+constexpr std::string_view opaqueBlitFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; varying vec2 v_uv;
+void main() { gl_FragColor = vec4(texture2D(t, v_uv).rgb, 1.0); }
+)"sv;
+constexpr std::string_view seedResampleFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; uniform vec4 u_extra[22]; varying vec2 v_uv;
+void main() { gl_FragColor = vec4(texture2D(t, v_uv).rgb, 1.0); }
+)"sv;
+constexpr std::string_view simpleFilterFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; uniform vec4 u_extra[22]; varying vec2 v_uv;
+void main() {
+  vec4 c = texture2D(t, v_uv);
+  mat4 matrix = mat4(u_extra[0], u_extra[1], u_extra[2], u_extra[3]);
+  vec4 transformed = matrix * c;
+  gl_FragColor = vec4(transformed.rgb, c.a) * u_extra[4].x;
+}
+)"sv;
+constexpr std::string_view maskImageFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; uniform sampler2D mask_t; varying vec2 v_uv;
+void main() { gl_FragColor = texture2D(t, v_uv) * texture2D(mask_t, v_uv).a; }
+)"sv;
+constexpr std::string_view blurFragmentSource = R"(#version 100
+precision highp float; precision highp int;
+uniform sampler2D t; uniform vec4 u_extra[22];
+varying vec2 v_uv0; varying vec2 v_uv1; varying vec2 v_uv2; varying vec2 v_uv3;
+varying vec2 v_uv4; varying vec2 v_uv5; varying vec2 v_uv6;
+float weight(int i) { int a = i < 0 ? -i : i; if (a == 0) return u_extra[2].x; if (a == 1) return u_extra[2].y; if (a == 2) return u_extra[2].z; return u_extra[2].w; }
+vec4 tap(vec2 uv, int i) {
+  vec2 region = step(u_extra[1].xy, uv) * step(uv, u_extra[1].zw);
+  return texture2D(t, uv) * weight(i) * region.x * region.y;
+}
+void main() {
+  gl_FragColor = tap(v_uv0, -3) + tap(v_uv1, -2) + tap(v_uv2, -1) + tap(v_uv3, 0) +
+                 tap(v_uv4, 1) + tap(v_uv5, 2) + tap(v_uv6, 3);
+}
+)"sv;
+constexpr std::string_view regionBlitFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; uniform vec4 u_extra[22]; varying vec2 v_uv;
+void main() { gl_FragColor = texture2D(t, mix(u_extra[1].xy, u_extra[1].zw, v_uv)); }
+)"sv;
+constexpr std::string_view dropShadowFragmentSource = R"(#version 100
+precision highp float; uniform sampler2D t; uniform vec4 u_extra[22]; varying vec2 v_uv;
+void main() {
+  vec2 uv = v_uv - u_extra[1].xy;
+  vec2 region = step(u_extra[1].zw, uv) * step(uv, u_extra[2].xy);
+  gl_FragColor = u_extra[0] * texture2D(t, uv).a * region.x * region.y;
+}
+)"sv;
+#else
 constexpr std::string_view vertexSource = R"(#version 300 es
 layout(std140) uniform Uniforms {
   mat4 mvp;
@@ -425,6 +608,7 @@ void main() {
   out_color = shadow.color * alpha;
 }
 )"sv;
+#endif
 
 std::string_view fragment_source(PipelineKind kind) {
   switch (kind) {
@@ -475,6 +659,10 @@ gl::GLuint compile_rml_program(VertexLayoutKind vertexLayout, PipelineKind kind,
   if (program == 0) {
     return 0;
   }
+#ifdef AURORA_GLES2
+  gl::register_uniform_binding(program, kCommonBlockBinding, "u_common", static_cast<uint32_t>(CommonUniformBindingSize));
+  gl::register_uniform_binding(program, kExtraBlockBinding, "u_extra", static_cast<uint32_t>(ExtraUniformBindingSize));
+#else
   const gl::GLuint commonIndex = gl::gl.GetUniformBlockIndex(program, "Uniforms");
   if (commonIndex != kInvalidBlockIndex) {
     gl::gl.UniformBlockBinding(program, commonIndex, kCommonBlockBinding);
@@ -486,6 +674,7 @@ gl::GLuint compile_rml_program(VertexLayoutKind vertexLayout, PipelineKind kind,
       gl::gl.UniformBlockBinding(program, index, kExtraBlockBinding);
     }
   }
+#endif
   gl::gl.UseProgram(program);
   const gl::GLint imageLoc = gl::gl.GetUniformLocation(program, "t");
   if (imageLoc >= 0) {
@@ -514,7 +703,12 @@ void initialize_pipeline() {
       .addressW = gl::AddressMode::Repeat,
       .magFilter = gl::FilterMode::Linear,
       .minFilter = gl::FilterMode::Linear,
-      .mipmapFilter = gl::MipmapFilterMode::Linear,
+      .mipmapFilter =
+#ifdef AURORA_GLES2
+          gl::MipmapFilterMode::Undefined,
+#else
+          gl::MipmapFilterMode::Linear,
+#endif
       .maxAnisotropy = 1,
   };
   g_sampler = gfx::sampler_ref(samplerDesc);
@@ -639,7 +833,14 @@ gl::Pipeline create_pipeline(const PipelineConfig& config) {
   // Geometry draws feed an interleaved Rml::Vertex buffer (its own VAO); fullscreen and
   // blur pipelines are attribute-less (gl_VertexID), so they use vertexLayout 0.
   pipeline.vertexLayout =
-      vertexLayoutKind == VertexLayoutKind::Geometry ? gl::kRmlGeometryVertexLayout : 0u;
+      vertexLayoutKind == VertexLayoutKind::Geometry
+          ? gl::kRmlGeometryVertexLayout
+          :
+#ifdef AURORA_GLES2
+          gl::kFullscreenVertexLayout;
+#else
+          0u;
+#endif
   return pipeline;
 }
 

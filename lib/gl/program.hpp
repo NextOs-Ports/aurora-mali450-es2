@@ -22,6 +22,11 @@ namespace aurora::gl {
 // through `bindAttribs` (name -> location), applied between attach and link.
 GLuint compile_program(const char* vertexSource, const char* fragmentSource, const char* label);
 
+// Associate a classic vec4 uniform array with one logical UBO binding point.
+// Used by the GLES2 backend; native UBO builds compile these to no-ops.
+void register_uniform_binding(GLuint program, uint32_t binding, const char* uniformName, uint32_t maxBytes);
+void upload_uniform_binding(GLuint program, uint32_t binding, GLuint buffer, uint32_t offset, uint32_t size);
+
 // Post-link setup for a GX program: bind its `Uniform` std140 block to GL binding
 // point 0 (SetBindGroup(1) glBindBufferRange's here) and its `texN` sampler uniforms
 // to texture units 0..7 (GX slot i == unit i, S3). `expectedUniformSize` is the CPU

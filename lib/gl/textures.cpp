@@ -4,10 +4,35 @@
 #include "../internal.hpp"
 
 #include <vector>
+#ifdef AURORA_GLES2
+#include <unordered_map>
+#endif
 
 namespace aurora::gl {
 namespace {
 Module Log("aurora::gl");
+
+#ifdef AURORA_GLES2
+// GLES2 stores filtering and wrap state on textures rather than separate sampler
+// objects. Keep the public lightweight GLuint handle and resolve it here.
+std::unordered_map<GLuint, SamplerDescriptor> g_samplerDescriptors;
+// GLES2 has neither sampler objects nor core TEXTURE_MAX_LEVEL. A mipmapped
+// minification filter makes a texture incomplete unless every level down to
+// 1x1 exists, in which case sampling returns black. Track whether each texture
+// owns that complete chain so partial GX chains can safely use their base level.
+std::unordered_map<GLuint, bool> g_textureHasCompleteMipChain;
+GLuint g_nextSamplerId = 1;
+#endif
+
+uint32_t complete_mip_level_count(Extent3D size) {
+  uint32_t levels = 1;
+  uint32_t dimension = std::max(size.width, size.height);
+  while (dimension > 1) {
+    dimension >>= 1;
+    ++levels;
+  }
+  return levels;
+}
 
 GLint min_filter_enum(FilterMode min, MipmapFilterMode mip) {
   switch (mip) {
@@ -159,19 +184,59 @@ Texture create_texture(TextureFormat format, Extent3D size, uint32_t mips, bool 
   GLuint id = 0;
   gl.GenTextures(1, &id);
   gl.BindTexture(GL_TEXTURE_2D, id);
-  gl.TexStorage2D(GL_TEXTURE_2D, static_cast<GLsizei>(levels), info.internalFormat, static_cast<GLsizei>(size.width),
-                  static_cast<GLsizei>(size.height));
+#ifdef AURORA_GLES2
+  g_textureHasCompleteMipChain.emplace(id, levels >= complete_mip_level_count(size));
+#endif
+  if (gl.TexStorage2D != nullptr) {
+    gl.TexStorage2D(GL_TEXTURE_2D, static_cast<GLsizei>(levels), info.internalFormat, static_cast<GLsizei>(size.width),
+                    static_cast<GLsizei>(size.height));
+  } else {
+    uint32_t width = size.width;
+    uint32_t height = size.height;
+    for (uint32_t level = 0; level < levels; ++level) {
+      if (info.compressed) {
+        const uint32_t blocksW = (width + info.blockWidth - 1) / info.blockWidth;
+        const uint32_t blocksH = (height + info.blockHeight - 1) / info.blockHeight;
+        const GLsizei imageSize = static_cast<GLsizei>(blocksW * blocksH * info.blockBytes);
+        std::vector<uint8_t> zeros(static_cast<size_t>(imageSize), 0);
+        gl.CompressedTexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), info.internalFormat,
+                                static_cast<GLsizei>(width), static_cast<GLsizei>(height), 0, imageSize,
+                                zeros.data());
+      } else {
+#ifdef AURORA_GLES2
+        // ES2 glTexImage2D accepts unsized color/depth formats. Sized formats
+        // such as RGBA8 are TexStorage/ES3 vocabulary even if an extension
+        // advertises the corresponding storage precision.
+        GLint allocationFormat = static_cast<GLint>(info.external);
+#else
+        GLint allocationFormat = static_cast<GLint>(info.internalFormat);
+#endif
+        std::vector<uint8_t> zeros;
+        const void* initialData = nullptr;
+        if (renderable && level == 0 && !info.depth && info.bytesPerPixel > 0) {
+          zeros.resize(static_cast<size_t>(width) * height * info.bytesPerPixel, 0);
+          initialData = zeros.data();
+        }
+        gl.TexImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), allocationFormat, static_cast<GLsizei>(width),
+                      static_cast<GLsizei>(height), 0, info.external, info.type, initialData);
+      }
+      width = width > 1 ? width / 2 : 1;
+      height = height > 1 ? height / 2 : 1;
+    }
+  }
   // Sensible defaults; the actual sampler object drives filtering at draw time. A
   // full mip chain is declared but not necessarily uploaded, so clamp MAX_LEVEL.
+#ifndef AURORA_GLES2
   gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
   gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, static_cast<GLint>(levels - 1));
+#endif
   // glTexStorage2D leaves texel memory undefined. Renderable color targets (EFB-copy /
   // offscreen textures) can be sampled before anything renders into them (a GX effect
   // reads last frame's copy on the first frame, or a copy that hasn't run yet), and
   // sampling undefined GPU memory is exactly the driver-dependent behavior the Normalcy
   // Doctrine avoids — on desktop it surfaced as a red/magenta wash. Zero-fill level 0 so
   // an unpopulated copy reads opaque black.
-  if (renderable && !info.depth && !info.compressed && info.bytesPerPixel > 0) {
+  if (gl.TexStorage2D != nullptr && renderable && !info.depth && !info.compressed && info.bytesPerPixel > 0) {
     std::vector<uint8_t> zeros(static_cast<size_t>(size.width) * size.height * info.bytesPerPixel, 0);
     gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
     gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(size.width), static_cast<GLsizei>(size.height),
@@ -210,25 +275,49 @@ void upload_texture(const Texture& texture, uint32_t level, Origin3D offset, Ext
 
   gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
   const bool customStride = bytesPerRow != 0 && bytesPerRow != size.width * info.bytesPerPixel;
+#ifdef AURORA_GLES2
+  if (customStride) {
+    const auto* row = static_cast<const uint8_t*>(data);
+    for (uint32_t y = 0; y < size.height; ++y) {
+      gl.TexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), static_cast<GLint>(offset.x),
+                       static_cast<GLint>(offset.y + y), static_cast<GLsizei>(size.width), 1, info.external, info.type,
+                       row + static_cast<size_t>(y) * bytesPerRow);
+    }
+    return;
+  }
+#else
   if (customStride) {
     gl.PixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(bytesPerRow / info.bytesPerPixel));
   }
+#endif
   gl.TexSubImage2D(GL_TEXTURE_2D, static_cast<GLint>(level), static_cast<GLint>(offset.x), static_cast<GLint>(offset.y),
                    static_cast<GLsizei>(size.width), static_cast<GLsizei>(size.height), info.external, info.type, data);
   if (customStride) {
+#ifndef AURORA_GLES2
     gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
   }
 }
 
 void destroy_texture(Texture& texture) noexcept {
   if (texture.id != 0) {
     census::textures.sub(texture_gpu_bytes(texture.format, texture.size, texture.mips));
+#ifdef AURORA_GLES2
+    g_textureHasCompleteMipChain.erase(texture.id);
+#endif
     gl.DeleteTextures(1, &texture.id);
     texture.id = 0;
   }
 }
 
 Sampler create_sampler(const SamplerDescriptor& desc, bool anisotropySupported) {
+#ifdef AURORA_GLES2
+  (void)anisotropySupported;
+  const GLuint id = g_nextSamplerId++;
+  g_samplerDescriptors.emplace(id, desc);
+  census::samplers.add(0);
+  return Sampler{.id = id};
+#else
   GLuint id = 0;
   gl.GenSamplers(1, &id);
   gl.SamplerParameteri(id, GL_TEXTURE_WRAP_S, address_enum(desc.addressU));
@@ -243,14 +332,41 @@ Sampler create_sampler(const SamplerDescriptor& desc, bool anisotropySupported) 
   }
   census::samplers.add(0);
   return Sampler{.id = id};
+#endif
 }
 
 void destroy_sampler(Sampler& sampler) noexcept {
   if (sampler.id != 0) {
     census::samplers.sub(0);
+#ifdef AURORA_GLES2
+    g_samplerDescriptors.erase(sampler.id);
+#else
     gl.DeleteSamplers(1, &sampler.id);
+#endif
     sampler.id = 0;
   }
+}
+
+void apply_sampler_to_bound_texture(GLuint texture, GLuint sampler) {
+#ifdef AURORA_GLES2
+  const auto it = g_samplerDescriptors.find(sampler);
+  if (it == g_samplerDescriptors.end()) {
+    return;
+  }
+  const auto& desc = it->second;
+  const auto mipIt = g_textureHasCompleteMipChain.find(texture);
+  const bool completeMipChain = mipIt != g_textureHasCompleteMipChain.end() && mipIt->second;
+  const auto mipFilter = completeMipChain ? desc.mipmapFilter : MipmapFilterMode::Undefined;
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, address_enum(desc.addressU));
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, address_enum(desc.addressV));
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter_enum(desc.minFilter, mipFilter));
+  gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mag_filter_enum(desc.magFilter));
+  // Do not globally force CLAMP_TO_EDGE here. GX materials depend on repeated
+  // and mirrored atlas UVs; the descriptor above is the source of truth.
+#else
+  (void)texture;
+  (void)sampler;
+#endif
 }
 
 } // namespace aurora::gl

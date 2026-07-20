@@ -1,4 +1,6 @@
 #include "state.hpp"
+#include "textures.hpp"
+#include "program.hpp"
 
 #include <array>
 #include <cstring>
@@ -248,7 +250,11 @@ void apply_baked_state(const BakedState& state) {
   }
 
   // Primitive restart (S6): only strips enable it; the pipeline's flag decides.
+#ifdef AURORA_GLES2
+  s.primitiveRestart = 0;
+#else
   set_cap(GL_PRIMITIVE_RESTART_FIXED_INDEX, s.primitiveRestart, state.primitiveRestart);
+#endif
 
   // Stencil (RmlUi)
   set_cap(GL_STENCIL_TEST, s.stencilTest, state.stencilTest);
@@ -276,6 +282,12 @@ void use_program(GLuint program) {
   if (program != s.program) {
     gl.UseProgram(program);
     s.program = program;
+#ifdef AURORA_GLES2
+    // Classic uniforms are program-local, unlike UBO binding points.
+    for (auto& b : s.ubos) {
+      b = {kInvalidId, kInvalidId, kInvalidId};
+    }
+#endif
   }
 }
 
@@ -291,7 +303,8 @@ void bind_texture_unit(uint32_t unit, GLuint texture, GLuint sampler) {
     return;
   }
   auto& u = s.textures[unit];
-  if (u.texture != texture) {
+  const bool textureChanged = u.texture != texture;
+  if (textureChanged) {
     if (s.activeUnit != unit) {
       gl.ActiveTexture(GL_TEXTURE0 + unit);
       s.activeUnit = unit;
@@ -299,8 +312,12 @@ void bind_texture_unit(uint32_t unit, GLuint texture, GLuint sampler) {
     gl.BindTexture(GL_TEXTURE_2D, texture);
     u.texture = texture;
   }
-  if (u.sampler != sampler) {
+  if (u.sampler != sampler || textureChanged) {
+#ifdef AURORA_GLES2
+    apply_sampler_to_bound_texture(texture, sampler);
+#else
     gl.BindSampler(unit, sampler);
+#endif
     u.sampler = sampler;
   }
 }
@@ -311,7 +328,11 @@ void bind_uniform_range(uint32_t index, GLuint buffer, uint32_t offset, uint32_t
   }
   auto& b = s.ubos[index];
   if (b.buffer != buffer || b.offset != offset || b.size != size) {
+#ifdef AURORA_GLES2
+    upload_uniform_binding(s.program, index, buffer, offset, size);
+#else
     gl.BindBufferRange(GL_UNIFORM_BUFFER, index, buffer, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size));
+#endif
     b.buffer = buffer, b.offset = offset, b.size = size;
   }
 }

@@ -61,10 +61,18 @@ struct PipelineConfig {
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
 struct SeedResampleUniformBlock {
+#ifdef AURORA_GLES2
+  float samplerMode = 0.f;
+#else
   uint32_t samplerMode = 0;
+#endif
   float frameWidth = 0.f;
   float frameHeight = 0.f;
+#ifdef AURORA_GLES2
+  float _pad = 0.f;
+#else
   uint32_t _pad = 0;
+#endif
 };
 
 struct DrawData {

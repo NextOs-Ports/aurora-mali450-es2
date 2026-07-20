@@ -404,6 +404,7 @@ struct GlProcTable {
   void (*DeleteProgram)(GLuint) = nullptr;
   GLint (*GetUniformLocation)(GLuint, const GLchar*) = nullptr;
   void (*Uniform1i)(GLint, GLint) = nullptr;
+  void (*Uniform4fv)(GLint, GLsizei, const GLfloat*) = nullptr;
   GLuint (*GetUniformBlockIndex)(GLuint, const GLchar*) = nullptr;
   void (*UniformBlockBinding)(GLuint, GLuint, GLuint) = nullptr;
   void (*GetActiveUniformBlockiv)(GLuint, GLuint, GLenum, GLint*) = nullptr;

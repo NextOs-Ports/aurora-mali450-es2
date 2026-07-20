@@ -382,27 +382,46 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   buf.clear();
   buf.reserve_extra(info.uniformSize);
 
+#ifdef AURORA_GLES2
+  // Classic uniform arrays are uploaded as floats; integer-valued GX fields are
+  // represented exactly (all live values are small enough for fp32).
+  buf.append<f32>(static_cast<f32>(vtxStart));
+  buf.append<f32>(static_cast<f32>(g_gxState.currentPnMtx));
+#else
   buf.append(vtxStart);
   buf.append(g_gxState.currentPnMtx);
+#endif
   buf.append<f32>(g_gxState.renderViewport.width);
   buf.append<f32>(g_gxState.renderViewport.height);
   buf.append<f32>(g_gxState.logicalViewport.width);
   buf.append<f32>(g_gxState.logicalViewport.height);
   buf.append_zeroes(8); // pad
   for (const auto& vaRange : ranges.vaRanges) {
+#ifdef AURORA_GLES2
+    buf.append<f32>(static_cast<f32>(vaRange.offset));
+#else
     buf.append<u32>(vaRange.offset);
+#endif
   }
   if (info.lineMode != 0) {
     if (info.lineMode == 3) { // GX_POINTS
       buf.append<f32>(static_cast<f32>(g_gxState.pointSize) / 6.f);
       buf.append<f32>(1.0f);
       buf.append<f32>(tex_offset(g_gxState.pointTexOffset));
+#ifdef AURORA_GLES2
+      buf.append<f32>(static_cast<f32>(point_texcoord_mask()));
+#else
       buf.append<u32>(point_texcoord_mask());
+#endif
     } else { // GX_LINES / GX_LINESTRIP
       buf.append<f32>(static_cast<f32>(g_gxState.lineWidth) / 6.f);
       buf.append<f32>(g_gxState.lineHalfAspect ? 0.5f : 1.f);
       buf.append<f32>(tex_offset(g_gxState.lineTexOffset));
+#ifdef AURORA_GLES2
+      buf.append<f32>(static_cast<f32>(line_texcoord_mask()));
+#else
       buf.append<u32>(line_texcoord_mask());
+#endif
     }
   }
   buf.append(g_gxState.proj);
@@ -432,7 +451,11 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     buf.append(g_gxState.lights);
     // Light state for all channels
     for (int i = 0; i < 4; ++i) {
+#ifdef AURORA_GLES2
+      buf.append<f32>(static_cast<f32>(g_gxState.colorChannelState[i].lightMask.to_ulong()));
+#else
       buf.append<u32>(g_gxState.colorChannelState[i].lightMask.to_ulong());
+#endif
     }
   }
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {

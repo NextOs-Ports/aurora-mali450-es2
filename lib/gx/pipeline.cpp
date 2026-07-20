@@ -52,7 +52,8 @@ void render(const DrawData& data, gl::PassEncoder& pass) {
     // geometry lives in the persistent cross-frame cache buffer; everything else in the
     // shared per-frame vertex ring.
     const gl::Buffer& vtxBuffer = data.cachedGeometry ? gfx::g_nativeVertexCacheBuffer : gfx::g_vertexBuffer;
-    pass.SetVertexBuffer(0, vtxBuffer, data.vertRange.offset, data.vertRange.size);
+    pass.SetVertexBuffer(0, vtxBuffer, data.vertRange.offset, data.vertRange.size,
+                         /*stableLayout=*/data.cachedGeometry);
   }
   const gl::Buffer& idxBuffer = data.cachedGeometry ? gfx::g_nativeIndexCacheBuffer : gfx::g_indexBuffer;
   pass.SetIndexBuffer(idxBuffer, gl::IndexFormat::Uint16, data.idxRange.offset, data.idxRange.size);

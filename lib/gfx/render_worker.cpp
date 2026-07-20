@@ -188,7 +188,7 @@ void FrameSlotPool::reset() {
 
 size_t FrameSlotPool::free_count() const {
   std::lock_guard lock{m_mutex};
-  return static_cast<size_t>(std::ranges::count(m_freeSlots, true));
+  return static_cast<size_t>(std::count(m_freeSlots.begin(), m_freeSlots.end(), true));
 }
 
 void initialize() {
