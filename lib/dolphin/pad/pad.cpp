@@ -8,6 +8,8 @@
 
 #include <array>
 #include <algorithm>
+#include <ranges>
+#include <filesystem>
 #include <sys/stat.h>
 
 namespace {
