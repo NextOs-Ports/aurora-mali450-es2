@@ -82,6 +82,21 @@ u32 ARGetSize(void) { return aurora::g_config.mem2Size; }
 #pragma mark ARQ
 void ARQPostRequest(ARQRequest* request, u32 owner, u32 type, u32 priority, uintptr_t source, uintptr_t dest,
                     u32 length, ARQCallback callback) {
+  // The SDK records the request in the caller's ARQRequest before queueing it,
+  // and callbacks read those fields back out - Pikmin's doneDMA recovers its
+  // cache entry from request->owner. Leaving them uninitialised hands the game
+  // a garbage pointer the moment the callback fires.
+  if (request != nullptr) {
+    request->next = nullptr;
+    request->owner = owner;
+    request->type = type;
+    request->priority = priority;
+    request->source = static_cast<u32>(source);
+    request->dest = static_cast<u32>(dest);
+    request->length = length;
+    request->callback = callback;
+  }
+
   // Emulate ARAM DMA transfers using memcpy.
   // type 0 = MRAM -> ARAM, type 1 = ARAM -> MRAM
   if (type == ARAM_DIR_MRAM_TO_ARAM) {

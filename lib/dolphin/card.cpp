@@ -248,7 +248,9 @@ s32 CARDCheckAsync(const s32 chan, const CARDCallback callback) {
 
   const auto& card = GET_CARD(chan);
   const auto res = static_cast<s32>(card->getError());
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return static_cast<s32>(card->getError());
 }
 
@@ -270,7 +272,9 @@ s32 CARDCheckExAsync(const s32 chan, s32* xferBytes [[maybe_unused]], const CARD
   }
   const auto& card = GET_CARD(chan);
   const auto res = static_cast<s32>(card->getError());
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return static_cast<s32>(card->getError());
 }
 
@@ -299,7 +303,9 @@ s32 CARDCreateAsync(const s32 chan, const char* fileName, const u32 size, CARDFi
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDCreate(chan, fileName, size, fileInfo);
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -327,7 +333,9 @@ s32 CARDDeleteAsync(const s32 chan, const char* fileName, const CARDCallback cal
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDDelete(chan, fileName);
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -354,7 +362,9 @@ s32 CARDFastDeleteAsync(const s32 chan, const s32 fileNo, const CARDCallback cal
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDFastDelete(chan, fileNo);
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -395,7 +405,9 @@ s32 CARDFormatAsync(const s32 chan, const CARDCallback callback) {
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDFormat(chan);
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -586,7 +598,9 @@ s32 CARDRenameAsync(const s32 chan, const char* oldName, const char* newName, co
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDRename(chan, oldName, newName);
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -643,7 +657,9 @@ s32 CARDSetStatusAsync(const s32 chan, const s32 fileNo, const CARDStat* stat, c
     return CARD_RESULT_FATAL_ERROR;
   }
   const auto res = CARDSetStatus(chan, fileNo, stat);
-  callback(chan, res);
+  if (callback != nullptr) {
+    callback(chan, res);
+  }
   return res;
 }
 
@@ -707,7 +723,9 @@ s32 CARDRead(const CARDFileInfo* fileInfo, void* addr, s32 length, const s32 off
 s32 CARDReadAsync(const CARDFileInfo* fileInfo, void* addr, const s32 length, const s32 offset,
                   const CARDCallback callback) {
   const auto res = CARDRead(fileInfo, addr, length, offset);
-  callback(fileInfo->chan, res);
+  if (callback != nullptr) {
+    callback(fileInfo->chan, res);
+  }
   return res;
 }
 
@@ -736,7 +754,9 @@ s32 CARDWrite(const CARDFileInfo* fileInfo, const void* addr, const s32 length, 
 s32 CARDWriteAsync(const CARDFileInfo* fileInfo, const void* addr, const s32 length, const s32 offset,
                    const CARDCallback callback) {
   const auto res = CARDWrite(fileInfo, addr, length, offset);
-  callback(fileInfo->chan, res);
+  if (callback != nullptr) {
+    callback(fileInfo->chan, res);
+  }
   return res;
 }
 }
