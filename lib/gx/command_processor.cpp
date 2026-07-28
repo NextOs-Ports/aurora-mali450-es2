@@ -1920,10 +1920,21 @@ struct NativeAttrDesc {
   bool le; // source endianness (direct FIFO = false = big-endian)
 };
 
+static bool native_layout_needs_full_nbt_basis() {
+  for (u32 i = 0; i < g_gxState.numTexGens && i < MaxTexCoord; ++i) {
+    const auto& tcg = g_gxState.tcgs[i];
+    if (tcg.src == GX_TG_BINRM || tcg.src == GX_TG_TANGENT ||
+        (tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Build the native attribute layout for the current vertex format. Returns false
 // (declines to the storage path) for anything native cannot faithfully express:
-// NBT normals, exotic component types, missing position, >16 attributes, or an
-// indexed attr whose source array is not resident.
+// NBT tangent/binormal consumers, exotic component types, missing position,
+// >16 attributes, or an indexed attr whose source array is not resident.
 // Diagnostic: flip kLogNativeDecline to true to log (rate-limited) why a layout
 // declined native fetch and fell back to storage. Storage is impossible on Mali
 // (GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS=0), so every decline logged here is a draw
@@ -1933,7 +1944,7 @@ static constexpr bool kLogNativeDecline = false;
 static bool native_decline(int reason, GXVtxFmt fmt, int attr) {
   if constexpr (kLogNativeDecline) {
     static Module Log("aurora::gx");
-    static const char* const reasons[8] = {"NBT-normal",      "undecodable-type", "nonresident-index-array",
+    static const char* const reasons[8] = {"NBT-basis",       "undecodable-type", "nonresident-index-array",
                                             "non-direct-type", ">16-attrs",        "no-position",
                                             "?",               "?"};
     // Dedup by unique declined layout so the boot flood can't exhaust a fixed budget
@@ -1982,9 +1993,14 @@ static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs
     const auto cnt = comp_cnt_count(attr, attrFmt.cnt);
     const bool isMtxIdx = attr == GX_VA_PNMTXIDX || (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX);
     const bool isColor = attr == GX_VA_CLR0 || attr == GX_VA_CLR1;
-    // Native provides only a 3-component normal; NBT/NBT3 (cnt 9) falls back to storage.
+    // Native exposes a 3-component normal. Pikmin's GX_NRM_NBT array is
+    // N/B/T-contiguous, so its first three components are an exact normal and
+    // can use native fetch whenever no live texgen consumes B or T. Keep NBT3
+    // and real tangent-space consumers on the fallback path.
     if (attr == GX_VA_NRM && cnt > 3) {
-      return native_decline(0, fmt, i);
+      if (attrFmt.cnt != GX_NRM_NBT || native_layout_needs_full_nbt_basis()) {
+        return native_decline(0, fmt, i);
+      }
     }
     if (!isMtxIdx) {
       const auto compType = static_cast<GXCompType>(attrFmt.type);
