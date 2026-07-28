@@ -111,6 +111,25 @@ struct Command {
 };
 } // namespace aurora::gfx
 
+#ifdef __linux__
+#include <unistd.h>
+#endif
+
+// [mem-census] accessors defined next to the containers they measure.
+namespace aurora::gx {
+size_t debug_program_cache_count() noexcept;
+size_t debug_texture_cache_count() noexcept;
+size_t debug_tlut_cache_count() noexcept;
+size_t debug_tlut_dynamic_count() noexcept;
+size_t debug_copy_texture_count() noexcept;
+size_t debug_copy_texture_cache_count() noexcept;
+} // namespace aurora::gx
+
+namespace aurora::gfx {
+size_t debug_pipeline_count() noexcept;
+size_t debug_pipeline_pending_count() noexcept;
+} // namespace aurora::gfx
+
 namespace aurora::gfx {
 namespace {
 struct CachedBindGroup {
@@ -680,6 +699,48 @@ static void resume_efb_pass_loading(const RenderPass& prevPass);
 static void expire_cached_bind_groups();
 static void push_command(CommandType type, const Command::Data& data);
 
+// [mem-census]: sizes of every long-lived renderer-side container, plus VmRSS, once per
+// fps interval. Cheap (a handful of size() calls) and the only reliable way to see
+// monotonic growth in the field — symbol-based heap attribution does not work on this
+// binary (see HANDOFF).
+static size_t read_vm_rss_kb() noexcept {
+#ifdef __linux__
+  if (FILE* f = fopen("/proc/self/statm", "r")) {
+    long pages = 0, resident = 0;
+    const int n = fscanf(f, "%ld %ld", &pages, &resident);
+    fclose(f);
+    if (n == 2) {
+      return static_cast<size_t>(resident) * (sysconf(_SC_PAGESIZE) / 1024);
+    }
+  }
+#endif
+  return 0;
+}
+
+static void log_mem_census(const FramePacket& frame) {
+  size_t bindGroups;
+  {
+    std::lock_guard lock{g_bindGroupCacheMutex};
+    bindGroups = g_cachedBindGroups.size();
+  }
+  size_t samplers;
+  {
+    std::lock_guard lock{g_samplerCacheMutex};
+    samplers = g_cachedSamplers.size();
+  }
+  size_t snapshotEntries = 0;
+  for (const auto& pool : g_passSnapshotPools) {
+    snapshotEntries += pool.entries.size();
+  }
+  Log.info("[mem-census] rss {} MB | pipe {} (+{} pend) prog {} bind {} smp {} | texcache {} tlut {} (dyn {}) "
+           "copytex {}+{} | snap {} uploads {} dedup {}",
+           read_vm_rss_kb() / 1024, debug_pipeline_count(), debug_pipeline_pending_count(),
+           gx::debug_program_cache_count(), bindGroups, samplers, gx::debug_texture_cache_count(),
+           gx::debug_tlut_cache_count(), gx::debug_tlut_dynamic_count(), gx::debug_copy_texture_count(),
+           gx::debug_copy_texture_cache_count(), snapshotEntries, frame.textureUploads.size(),
+           frame.uniformDedup.size());
+}
+
 static void enqueue_op(FramePacket& frame, size_t frameSlot, uint32_t opIndex) {
   if (opIndex >= frame.ops.size()) {
     return;
@@ -867,6 +928,9 @@ void push_draw_command(clear::DrawData data) {
 
 template <>
 PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
+  if (const auto ref = find_pipeline_cached(ShaderType::Clear, config)) {
+    return *ref;
+  }
   return find_pipeline(ShaderType::Clear, config, [=] { return create_pipeline(config); });
 }
 
@@ -1356,6 +1420,11 @@ void push_draw_command(rmlui::DrawData data) {
 
 template <>
 PipelineRef pipeline_ref(const gx::PipelineConfig& config) {
+  // Hot per-draw path: resolve from the cache without constructing the (heap-allocating)
+  // creation callback; only a genuine miss pays for it.
+  if (const auto ref = find_pipeline_cached(ShaderType::GX, config)) {
+    return *ref;
+  }
   return find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });
 }
 
@@ -1652,6 +1721,7 @@ void end_frame(EndFrameCallback callback) {
       s_vertBytes = 0;
       s_indexBytes = 0;
       s_textureBytes = 0;
+      log_mem_census(frame);
     }
   }
   frame.stats.drawCallCount = g_drawCallCount;

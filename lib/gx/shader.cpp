@@ -1846,4 +1846,10 @@ void clear_shader_program_cache() noexcept {
   std::lock_guard lock{g_programCacheMutex};
   g_programByShaderHash.clear();
 }
+
+// [mem-census] accessor
+size_t debug_program_cache_count() noexcept {
+  std::lock_guard lock{g_programCacheMutex};
+  return g_programByShaderHash.size();
+}
 } // namespace aurora::gx

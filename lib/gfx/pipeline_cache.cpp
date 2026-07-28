@@ -1203,6 +1203,38 @@ static void stop_pipeline_cache_writer() {
   g_pipelineCacheWriteQueue.clear();
 }
 
+// Allocation-free fast path for the hot per-draw lookup. Building the NewPipelineCallback
+// argument for find_pipeline() heap-allocates a copy of the whole PipelineConfig (~2.5 KB
+// for GX) on EVERY call -- ~600 times a frame once the scene is warm, when the pipeline is
+// almost always already cached. Callers try this first and only construct the creation
+// callback on a genuine miss. Returns nullopt when the pipeline is missing OR when the hit
+// needs its firstFrameUsed bookkeeping updated (the slow path handles that).
+template <typename PipelineConfig>
+static std::optional<PipelineRef> find_pipeline_cached_impl(ShaderType type, const PipelineConfig& config) {
+  const PipelineRef hash = xxh3_hash(config, static_cast<HashType>(type));
+  if (hash == g_lastPipelineRef) {
+    return hash;
+  }
+  const uint32_t frameUsed = current_frame();
+  std::scoped_lock guard{g_pipelineMutex};
+  const auto it = g_pipelines.find(hash);
+  if (it == g_pipelines.end() || frameUsed < it->second.firstFrameUsed) {
+    return std::nullopt;
+  }
+  g_lastPipelineRef = hash;
+  return hash;
+}
+
+template <>
+std::optional<PipelineRef> find_pipeline_cached(ShaderType type, const clear::PipelineConfig& config) {
+  return find_pipeline_cached_impl(type, config);
+}
+
+template <>
+std::optional<PipelineRef> find_pipeline_cached(ShaderType type, const gx::PipelineConfig& config) {
+  return find_pipeline_cached_impl(type, config);
+}
+
 template <>
 PipelineRef find_pipeline(ShaderType type, const clear::PipelineConfig& config, NewPipelineCallback&& cb) {
   return find_pipeline_impl(type, config, std::move(cb));
@@ -1289,6 +1321,16 @@ bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline) {
   }
   pipeline = it->second.pipeline;
   return true;
+}
+
+// [mem-census] accessors
+size_t debug_pipeline_count() noexcept {
+  std::lock_guard guard{g_pipelineMutex};
+  return g_pipelines.size();
+}
+size_t debug_pipeline_pending_count() noexcept {
+  std::lock_guard guard{g_pipelineMutex};
+  return g_pipelineQueue.size() + g_backgroundPipelineQueue.size() + g_pendingPipelines.size();
 }
 
 } // namespace aurora::gfx

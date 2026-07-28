@@ -844,6 +844,20 @@ void shutdown() noexcept {
   clear_copy_texture_cache();
   clear_shader_program_cache();
 }
+
+// [mem-census] accessors: sizes of the long-lived GX caches, logged once per fps
+// interval from gfx::end_frame to make monotonic growth visible in the field.
+size_t debug_texture_cache_count() noexcept { return s_textureObjectCaches.size(); }
+size_t debug_tlut_cache_count() noexcept { return s_tlutObjectCaches.size(); }
+size_t debug_tlut_dynamic_count() noexcept {
+  size_t n = 0;
+  for (const auto& [_, cache] : s_tlutObjectCaches) {
+    n += cache.dynamicPaletteTextures.size() + cache.staticTextureUsers.size();
+  }
+  return n;
+}
+size_t debug_copy_texture_count() noexcept { return g_gxState.copyTextures.size(); }
+size_t debug_copy_texture_cache_count() noexcept { return g_gxState.copyTextureCache.size(); }
 } // namespace aurora::gx
 
 namespace aurora {

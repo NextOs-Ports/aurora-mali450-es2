@@ -3,6 +3,7 @@
 #include "common.hpp"
 
 #include <functional>
+#include <optional>
 
 namespace aurora::gfx::clear {
 struct PipelineConfig;
@@ -27,6 +28,12 @@ void end_pipeline_frame();
 
 template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
+
+// Allocation-free lookup for the hot per-draw path: returns the ref when the pipeline is
+// already cached and needs no bookkeeping, nullopt otherwise (caller falls back to
+// find_pipeline, which may build/queue the pipeline).
+template <typename Config>
+std::optional<PipelineRef> find_pipeline_cached(ShaderType type, const Config& config);
 
 bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline);
 
