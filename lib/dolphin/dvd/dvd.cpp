@@ -65,10 +65,27 @@ public:
   }
 
   int64_t read(uint8_t* buf, size_t len) override {
+#ifdef PIKI_TRACE_DVDCOUNT
+    // Symbol-free way to test "one leak per nod call": compare these counts
+    // against the number of outstanding allocations the leak profiler reports.
+    static unsigned long reads = 0, bytes = 0;
+    if ((++reads % 20000) == 0) {
+      bytes += len;
+      fprintf(stderr, "[dvdcount] nod_read calls=%lu\n", reads);
+      fflush(stderr);
+    }
+#endif
     return nod_read(handle, buf, len);
   }
 
   int64_t seek(int64_t offset, int32_t whence) override {
+#ifdef PIKI_TRACE_DVDCOUNT
+    static unsigned long seeks = 0;
+    if ((++seeks % 20000) == 0) {
+      fprintf(stderr, "[dvdcount] nod_seek calls=%lu\n", seeks);
+      fflush(stderr);
+    }
+#endif
     return nod_seek(handle, offset, whence);
   }
 };
