@@ -235,19 +235,56 @@ static void wait_frame_buffer_fence(size_t slot) {
   set.fence = nullptr;
 }
 // Persistent caches for CPU-expanded native-fetch geometry. Separate from the per-frame
-// staging rings so cached ranges can never be clobbered by ring uploads. Filled once per
-// unique mesh (by content hash) and referenced every subsequent frame.
+// staging rings so cached ranges can never be clobbered by ring uploads. Two banks avoid
+// the old all-or-nothing reset cliff: when one fills, recording switches to the other and
+// keeps the full previous bank available while the new working set warms.
 gl::Buffer g_nativeVertexCacheBuffer;
 gl::Buffer g_nativeIndexCacheBuffer;
-static constexpr uint64_t NativeGeomVertexCacheSize = 24ull * 1024 * 1024;
-static constexpr uint64_t NativeGeomIndexCacheSize = 4ull * 1024 * 1024;
-// Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame
-// boundary). The generation counter bumps on each reset so CPU-side content maps can
-// drop entries that point at now-recycled ranges.
+static constexpr uint32_t NativeGeomCacheBankCount = 2;
+static constexpr uint64_t NativeGeomVertexBankSize = 24ull * 1024 * 1024;
+static constexpr uint64_t NativeGeomIndexBankSize = 4ull * 1024 * 1024;
+static constexpr uint64_t NativeGeomVertexCacheSize = NativeGeomVertexBankSize * NativeGeomCacheBankCount;
+static constexpr uint64_t NativeGeomIndexCacheSize = NativeGeomIndexBankSize * NativeGeomCacheBankCount;
+// Bump-allocator cursors point inside the active bank. On exhaustion, bank rotation is
+// deferred to a frame boundary. The generation counter bumps on each rotation so the
+// CPU-side map can drop only entries in the bank about to be overwritten.
 static uint32_t s_nativeVertexCacheOffset = 0;
 static uint32_t s_nativeIndexCacheOffset = 0;
+static uint32_t s_nativeGeomCacheBank = 0;
 static uint32_t s_nativeGeomCacheGeneration = 0;
 static bool s_nativeGeomCacheResetPending = false;
+// Cache promotions used to enqueue one glBufferSubData per mesh (vertices and indices
+// separately). A scene could promote thousands of meshes on its second appearance,
+// overflowing the bounded worker queue and spending whole frames in Mali's buffer-range
+// invalidation code. Accumulate each monotonic cache range on the recording thread and
+// submit at most one contiguous upload per buffer and render pass.
+struct PendingNativeGeomUpload {
+  ByteBuffer bytes;
+  uint32_t baseOffset = 0;
+  bool active = false;
+};
+static PendingNativeGeomUpload s_pendingNativeVertexUpload;
+static PendingNativeGeomUpload s_pendingNativeIndexUpload;
+
+static void flush_pending_native_geom_upload(PendingNativeGeomUpload& pending, const gl::Buffer& buffer) {
+  if (!pending.active || pending.bytes.empty()) {
+    pending.bytes.clear();
+    pending.active = false;
+    return;
+  }
+  std::vector<uint8_t> copy(pending.bytes.size());
+  std::memcpy(copy.data(), pending.bytes.data(), pending.bytes.size());
+  const uint32_t offset = pending.baseOffset;
+  pending.bytes.clear();
+  pending.active = false;
+  render_worker::enqueue_work(
+      [buffer, offset, copy = std::move(copy)] { gl::upload_buffer(buffer, offset, copy.data(), copy.size()); });
+}
+
+static void flush_pending_native_geom_uploads() {
+  flush_pending_native_geom_upload(s_pendingNativeVertexUpload, g_nativeVertexCacheBuffer);
+  flush_pending_native_geom_upload(s_pendingNativeIndexUpload, g_nativeIndexCacheBuffer);
+}
 // Phase 1: the WebGPU staging-buffer + MapAsync machinery is gone. Frame data is
 // collected into plain owned ByteBuffers and (from Phase 2) uploaded with
 // glBufferSubData on the worker. No mapping states, no staging slot pool.
@@ -258,6 +295,15 @@ static PipelineRef g_currentPipeline;
 AuroraStats g_stats{};
 uint32_t g_drawCallCount = 0;
 uint32_t g_mergedDrawCallCount = 0;
+namespace perfstall {
+std::atomic<uint64_t> queueWaitNs{0};
+std::atomic<uint64_t> presentWaitNs{0};
+std::atomic<uint64_t> blitSwapNs{0};
+std::atomic<uint64_t> geomHashNs{0};
+std::atomic<uint64_t> geomExpandNs{0};
+std::atomic<uint64_t> drawCfgNs{0};
+std::atomic<uint64_t> drawUniNs{0};
+} // namespace perfstall
 
 using CommandList = std::vector<Command>;
 struct RenderPass {
@@ -346,6 +392,10 @@ struct FramePacket {
   std::deque<TextureUpload> textureUploads;
   ByteBuffer verts;
   ByteBuffer uniforms;
+  // Exact same-frame uniform payloads can be shared by any number of draws.
+  // The hash only finds a candidate; push_uniform verifies size and bytes
+  // before reusing its aligned range, so collisions cannot change rendering.
+  absl::flat_hash_map<HashType, Range> uniformDedup;
   ByteBuffer indices;
   ByteBuffer storage;
   ByteBuffer textureUpload;
@@ -374,6 +424,7 @@ struct FramePacket {
     textureUploads.clear();
     verts.clear();
     uniforms.clear();
+    uniformDedup.clear();
     indices.clear();
     storage.clear();
     textureUpload.clear();
@@ -411,7 +462,7 @@ static std::atomic_int64_t g_cpuFrameTimeNs = 0;
 // Dusklight: emit a periodic presented-frame-rate line for on-device perf measurement. Cheap;
 // constexpr-gated (no env var, per the single-purpose Mali fork convention).
 static constexpr bool kLogFps = true;
-static constexpr double kFpsLogIntervalSeconds = 30.0;
+static constexpr double kFpsLogIntervalSeconds = 5.0;
 static PresentClock::time_point g_cpuFrameStart;
 static constexpr auto FrameStartSafetyMargin = std::chrono::milliseconds{2};
 static constexpr auto MaxPacingSample = std::chrono::milliseconds{250};
@@ -645,6 +696,9 @@ static void enqueue_op(FramePacket& frame, size_t frameSlot, uint32_t opIndex) {
 
 static void enqueue_pass(FramePacket& frame, size_t frameSlot, uint32_t passIndex) {
   seal_pass(frame, passIndex);
+  // Cache ranges referenced by this pass must reach the worker before its draw commands.
+  // Coalescing here turns a promotion storm into two ordered glBufferSubData calls.
+  flush_pending_native_geom_uploads();
   const auto opIndex = static_cast<uint32_t>(frame.ops.size());
   frame.ops.emplace_back(capture_frame_op(frame, FrameOpType::RenderPass, passIndex));
   enqueue_op(frame, frameSlot, opIndex);
@@ -1422,7 +1476,12 @@ void shutdown() {
   g_nativeIndexCacheBuffer = {};
   s_nativeVertexCacheOffset = 0;
   s_nativeIndexCacheOffset = 0;
+  s_nativeGeomCacheBank = 0;
   s_nativeGeomCacheResetPending = false;
+  s_pendingNativeVertexUpload.bytes.clear();
+  s_pendingNativeVertexUpload.active = false;
+  s_pendingNativeIndexUpload.bytes.clear();
+  s_pendingNativeIndexUpload.active = false;
   ++s_nativeGeomCacheGeneration;
   for (auto& packet : g_framePackets) {
     packet = {};
@@ -1465,12 +1524,15 @@ bool begin_frame() {
   g_passSnapshotPools[frameSlot].used = 0;
 
   if (s_nativeGeomCacheResetPending) {
-    // Deferred cache reset: every frame that referenced the old cached ranges has already
-    // been submitted; recycling the cache regions from offset 0 cannot race the GPU's reads
-    // of the old contents. Bump the generation so CPU-side content maps drop stale entries.
+    // Deferred two-bank rotation. Keep the just-filled bank hot and recycle only the
+    // alternate bank. Render-worker FIFO ordering places its replacement uploads after
+    // all previously submitted draws that can still reference the old contents.
     s_nativeGeomCacheResetPending = false;
-    s_nativeVertexCacheOffset = 0;
-    s_nativeIndexCacheOffset = 0;
+    s_nativeGeomCacheBank = (s_nativeGeomCacheBank + 1) % NativeGeomCacheBankCount;
+    s_nativeVertexCacheOffset =
+        static_cast<uint32_t>(s_nativeGeomCacheBank * NativeGeomVertexBankSize);
+    s_nativeIndexCacheOffset =
+        static_cast<uint32_t>(s_nativeGeomCacheBank * NativeGeomIndexBankSize);
     ++s_nativeGeomCacheGeneration;
   }
 
@@ -1537,26 +1599,61 @@ void end_frame(EndFrameCallback callback) {
     const double cpuFrameTimeMs = std::chrono::duration<double, std::milli>{cpuFrameTime}.count();
     TracyPlot("aurora: cpuFrameTimeMs", cpuFrameTimeMs);
   }
-  // Dusklight: periodic wall-clock FPS. Reports presented-frame rate, wall ms/frame, and the
-  // CPU-side portion (g_cpuFrameTimeNs EMA) so we can read CPU- vs present-bound at a glance.
+  auto& frame = current_frame_packet();
+  // Periodic wall-clock FPS plus recording pressure. Averages over the same interval make
+  // upload-bound Mali scenes diagnosable without a profiler attached to the handheld.
   if constexpr (kLogFps) {
     static uint32_t s_fpsFrames = 0;
     static PresentClock::time_point s_fpsMark{};
+    static uint64_t s_draws = 0;
+    static uint64_t s_mergedDraws = 0;
+    static uint64_t s_passes = 0;
+    static uint64_t s_vertBytes = 0;
+    static uint64_t s_indexBytes = 0;
+    static uint64_t s_textureBytes = 0;
     const auto fpsNow = PresentClock::now();
     if (s_fpsMark.time_since_epoch().count() == 0) {
       s_fpsMark = fpsNow;
     }
     ++s_fpsFrames;
+    s_draws += g_drawCallCount;
+    s_mergedDraws += g_mergedDrawCallCount;
+    s_passes += frame.renderPasses.size();
+    s_vertBytes += frame.verts.size();
+    s_indexBytes += frame.indices.size();
+    s_textureBytes += frame.textureUpload.size();
     const double fpsElapsed = std::chrono::duration<double>{fpsNow - s_fpsMark}.count();
     if (fpsElapsed >= kFpsLogIntervalSeconds) {
-      Log.info("[fps] {:.2f} fps, {:.1f} ms/frame (cpu {:.1f} ms) over {} frames",
+      const double invFrames = 1.0 / static_cast<double>(s_fpsFrames);
+      // Stall split: how much of each recorded frame the recording thread spent blocked on
+      // worker-queue backpressure (q), waiting for a presentable frame (w), and in the
+      // main-thread blit+swap (b). High w/b = GPU/worker-bound; all ~0 = decode-bound.
+      const double invFramesMs = invFrames / 1.0e6;
+      const double stallQueueMs = perfstall::queueWaitNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      const double stallPresentMs = perfstall::presentWaitNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      const double stallBlitMs = perfstall::blitSwapNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      const double geomHashMs = perfstall::geomHashNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      const double geomExpandMs = perfstall::geomExpandNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      const double drawCfgMs = perfstall::drawCfgNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      const double drawUniMs = perfstall::drawUniNs.exchange(0, std::memory_order_relaxed) * invFramesMs;
+      Log.info("[fps] {:.2f} fps, {:.1f} ms/frame (cpu {:.1f} ms, stall q{:.1f}+w{:.1f}+b{:.1f}, drain h{:.1f}+e{:.1f}+c{:.1f}+u{:.1f}), avg draws {:.0f}+{:.0f} merged, "
+               "passes {:.1f}, upload {:.0f}K vtx + {:.0f}K idx + {:.0f}K tex over {} frames",
                s_fpsFrames / fpsElapsed, 1000.0 * fpsElapsed / s_fpsFrames,
-               g_cpuFrameTimeNs.load(std::memory_order_relaxed) / 1.0e6, s_fpsFrames);
+               g_cpuFrameTimeNs.load(std::memory_order_relaxed) / 1.0e6, stallQueueMs, stallPresentMs, stallBlitMs,
+               geomHashMs, geomExpandMs, drawCfgMs, drawUniMs,
+               s_draws * invFrames,
+               s_mergedDraws * invFrames, s_passes * invFrames, s_vertBytes * invFrames / 1024.0,
+               s_indexBytes * invFrames / 1024.0, s_textureBytes * invFrames / 1024.0, s_fpsFrames);
       s_fpsFrames = 0;
       s_fpsMark = fpsNow;
+      s_draws = 0;
+      s_mergedDraws = 0;
+      s_passes = 0;
+      s_vertBytes = 0;
+      s_indexBytes = 0;
+      s_textureBytes = 0;
     }
   }
-  auto& frame = current_frame_packet();
   frame.stats.drawCallCount = g_drawCallCount;
   frame.stats.mergedDrawCallCount = g_mergedDrawCallCount;
   frame.stats.lastVertSize = frame.verts.size();
@@ -2233,21 +2330,29 @@ static bool ensure_native_geom_cache_buffers() {
   return g_nativeVertexCacheBuffer && g_nativeIndexCacheBuffer;
 }
 
-// Bump-allocate `length` bytes from a persistent cache buffer and upload the data on the
-// render worker (FIFO-ordered after prior submits, so it never races a prior frame's reads).
-static std::pair<Range, bool> push_native_cached(const gl::Buffer& buffer, uint32_t& cursor, uint64_t limit,
-                                                 const uint8_t* data, size_t length) {
+// Bump-allocate `length` bytes from a persistent cache buffer and append them to this
+// pass's contiguous promotion batch. enqueue_pass flushes the batch before its draws.
+static std::pair<Range, bool> push_native_cached(PendingNativeGeomUpload& pending, uint32_t& cursor,
+                                                 uint64_t bankSize, const uint8_t* data, size_t length) {
   const uint32_t offset = static_cast<uint32_t>(AURORA_ALIGN(cursor, 4));
   const size_t alignedSize = AURORA_ALIGN(length, 4);
-  if (static_cast<uint64_t>(offset) + alignedSize > limit) {
+  const uint64_t bankEnd = (static_cast<uint64_t>(s_nativeGeomCacheBank) + 1) * bankSize;
+  if (static_cast<uint64_t>(offset) + alignedSize > bankEnd) {
     return {{}, false};
   }
-  // The GL upload must run on the render worker (it owns the context). The copy keeps the
-  // data alive until the worker executes the glBufferSubData.
-  std::vector<uint8_t> copy(alignedSize);
-  memcpy(copy.data(), data, length);
-  render_worker::enqueue_work(
-      [buffer, offset, copy = std::move(copy)] { gl::upload_buffer(buffer, offset, copy.data(), copy.size()); });
+  if (!pending.active) {
+    pending.baseOffset = offset;
+    pending.active = true;
+  }
+  const uint64_t pendingEnd = static_cast<uint64_t>(pending.baseOffset) + pending.bytes.size();
+  CHECK(offset >= pendingEnd, "native geometry promotion ranges moved backwards");
+  if (offset > pendingEnd) {
+    pending.bytes.append_zeroes(static_cast<size_t>(offset - pendingEnd));
+  }
+  pending.bytes.append(data, length);
+  if (alignedSize > length) {
+    pending.bytes.append_zeroes(alignedSize - length);
+  }
   cursor = offset + static_cast<uint32_t>(alignedSize);
   return {Range{offset, static_cast<uint32_t>(length)}, true};
 }
@@ -2256,7 +2361,7 @@ std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t leng
   if (!ensure_native_geom_cache_buffers()) {
     return {{}, false};
   }
-  return push_native_cached(g_nativeVertexCacheBuffer, s_nativeVertexCacheOffset, NativeGeomVertexCacheSize, data,
+  return push_native_cached(s_pendingNativeVertexUpload, s_nativeVertexCacheOffset, NativeGeomVertexBankSize, data,
                             length);
 }
 
@@ -2264,18 +2369,36 @@ std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t le
   if (!ensure_native_geom_cache_buffers()) {
     return {{}, false};
   }
-  return push_native_cached(g_nativeIndexCacheBuffer, s_nativeIndexCacheOffset, NativeGeomIndexCacheSize, data, length);
+  return push_native_cached(s_pendingNativeIndexUpload, s_nativeIndexCacheOffset, NativeGeomIndexBankSize, data,
+                            length);
 }
 
 void request_native_geometry_cache_reset() noexcept { s_nativeGeomCacheResetPending = true; }
 uint32_t native_geom_cache_generation() noexcept { return s_nativeGeomCacheGeneration; }
+uint32_t native_geom_cache_bank() noexcept { return s_nativeGeomCacheBank; }
 
 Range push_uniform(const uint8_t* data, size_t length) {
   ZoneScoped;
   if (!check_recording("push_uniform")) {
     return {};
   }
-  return push(current_frame_packet().uniforms, data, length, webgpu::g_uniformBufferOffsetAlignment);
+  auto& frame = current_frame_packet();
+  if (length == 0) {
+    return push(frame.uniforms, data, length, webgpu::g_uniformBufferOffsetAlignment);
+  }
+  const auto hash = xxh3_hash_s(data, length, static_cast<HashType>(length));
+  const auto candidate = frame.uniformDedup.find(hash);
+  if (candidate != frame.uniformDedup.end()) {
+    const auto& range = candidate->second;
+    if (range.size == length && range.offset <= frame.uniforms.size() &&
+        length <= frame.uniforms.size() - range.offset &&
+        std::memcmp(frame.uniforms.data() + range.offset, data, length) == 0) {
+      return range;
+    }
+  }
+  const auto range = push(frame.uniforms, data, length, webgpu::g_uniformBufferOffsetAlignment);
+  frame.uniformDedup.try_emplace(hash, range);
+  return range;
 }
 
 Range push_storage(const uint8_t* data, size_t length) {

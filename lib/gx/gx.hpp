@@ -375,6 +375,15 @@ struct GXState {
   u8 numTevStages = 0;
   u8 numTexGens = 0;
   bool stateDirty = true;
+  // Finer-grained companions to stateDirty, consumed by the native-draw memo in
+  // push_native_gx_draw. pipelineStateDirty covers every input of
+  // populate_pipeline_config/build_shader_info (TEV, channels, texgen, blend, depth,
+  // fog type, vertex layout...). texStateDirty covers texture/TLUT binds and EFB copy
+  // versions (resolve_sampled_textures/build_bind_groups inputs). Uniform-value-only
+  // writes (XF matrices, lights, TEV register colors, fog params) set neither, which
+  // is what lets consecutive per-object draws reuse the previous pipeline/bind groups.
+  bool pipelineStateDirty = true;
+  bool texStateDirty = true;
   std::array<u32, 0x100> bpRegCache = [] {
     std::array<u32, 0x100> regs{};
     regs[0xFE] = 0x00FFFFFF;
@@ -482,8 +491,20 @@ struct ShaderInfo {
   std::bitset<MaxTextures> sampledTextures;
   std::bitset<MaxKColors> sampledKColors;
   std::bitset<MaxColorChannels / 2> sampledColorChannels;
+  // TEV can consume raster RGB and alpha independently. Track the components
+  // that actually reach a stage so the GLES2 emitter does not generate an
+  // entire eight-light equation for a dead half of the channel.
+  std::bitset<MaxColorChannels / 2> sampledColorChannelRgb;
+  std::bitset<MaxColorChannels / 2> sampledColorChannelAlpha;
+  // Lit channels with GX_DF_NONE + GX_AF_NONE have no vertex-dependent
+  // lighting term. Their enabled-light color sum is computed on the CPU and
+  // uploaded as one vec4 instead of emitting eight shader branches.
+  std::bitset<MaxColorChannels> precomputedLightChannels;
   std::bitset<MaxTevRegs> loadsTevReg;
   std::bitset<MaxTevRegs> writesTevReg;
+  // Texture matrices referenced by live texgens. GLES2 packs only these
+  // matrices after the position palette instead of uploading all ten.
+  std::bitset<MaxTexMtx> usedTexMtxs;
   std::bitset<MaxPTTexMtx> usesPTTexMtx;
   std::bitset<MaxVtxAttr> indexAttr;
   std::bitset<MaxIndStages> usedIndStages;
@@ -496,6 +517,10 @@ struct ShaderInfo {
   // or the normal-visualization debug path. Gates the 480B nrm_mtx upload for unlit draws.
   bool usesNormals : 1 = false;
   u8 lineMode : 2 = 0;
+  // Number of position/normal palette entries present in the uniform payload.
+  // GLES2 can collapse this to the current matrix when no vertex/texgen path
+  // dynamically indexes the position palette.
+  u8 pnMtxCount = MaxPnMtx;
 };
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};

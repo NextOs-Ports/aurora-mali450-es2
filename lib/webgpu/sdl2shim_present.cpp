@@ -635,7 +635,12 @@ void flush_present() {
     // g_framesOwed drops to zero when the worker reports a frame it could not present, which is
     // also a reason to stop waiting.
     const auto ready = [&] { return g_aborting || g_hasReadyFrame || g_framesOwed <= 0; };
-    if (!g_frameReady.wait_for(lock, PresentWaitTimeout, ready)) {
+    const auto waitStart = std::chrono::steady_clock::now();
+    const bool waited = g_frameReady.wait_for(lock, PresentWaitTimeout, ready);
+    gfx::perfstall::presentWaitNs.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count(),
+        std::memory_order_relaxed);
+    if (!waited) {
       Log.warn("[sdl2shim-efb] timed out waiting for the render worker to submit a frame");
       return;
     }
@@ -652,7 +657,11 @@ void flush_present() {
   Slot& slot = g_slots[slotIndex];
   const bool presentable = window::is_presentable();
   if (presentable) {
+    const auto blitStart = std::chrono::steady_clock::now();
     blit_and_swap(slot);
+    gfx::perfstall::blitSwapNs.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - blitStart).count(),
+        std::memory_order_relaxed);
   }
   destroy_sync(slot.fwdSync);
 

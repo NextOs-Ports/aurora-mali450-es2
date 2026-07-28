@@ -339,7 +339,6 @@ GameController* get_controller_for_player(uint32_t player) noexcept {
     }
   }
 
-#if 0
   /* If we don't have a controller assigned to this port use the first unassigned controller */
   if (!g_GameControllers.empty()) {
     int32_t availIndex = -1;
@@ -353,10 +352,10 @@ GameController* get_controller_for_player(uint32_t player) noexcept {
     }
     if (availIndex != -1) {
       set_player_index(availIndex, player);
+      Log.info("Auto-assigned controller instance {} to player {}", availIndex, player + 1);
       return ct;
     }
   }
-#endif
   return nullptr;
 }
 
@@ -397,6 +396,19 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
              controller.m_pid, static_cast<int>(SDL_GetGamepadType(ctrl)));
     g_GameControllers[instance] = controller;
     apply_port_preferences();
+    if (SDL_GetGamepadPlayerIndex(ctrl) < 0) {
+      bool playerOneOccupied = false;
+      for (const auto& [otherInstance, otherController] : g_GameControllers) {
+        if (otherInstance != instance && SDL_GetGamepadPlayerIndex(otherController.m_controller) == 0) {
+          playerOneOccupied = true;
+          break;
+        }
+      }
+      if (!playerOneOccupied) {
+        SDL_SetGamepadPlayerIndex(ctrl, 0);
+        Log.info("Auto-assigned controller instance {} to player 1", instance);
+      }
+    }
     return instance;
   }
 

@@ -3,6 +3,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -182,6 +183,24 @@ inline constexpr uint64_t TextureUploadSize = 25165824;  // 24mb
 extern AuroraStats g_stats;
 extern uint32_t g_drawCallCount;
 extern uint32_t g_mergedDrawCallCount;
+// Recording-thread stall accounting for the periodic [fps] line. Each accumulator counts
+// nanoseconds the recording thread spent blocked this logging interval: worker-queue
+// backpressure (push into a full BoundedQueue), waiting for the worker to publish a
+// presentable frame, and the main-thread blit+swap itself. Written by their respective
+// modules, read+reset by end_frame's stats block (all on the recording thread except the
+// queue counter, which is also recording-thread-only — plain atomics keep it simple).
+namespace perfstall {
+extern std::atomic<uint64_t> queueWaitNs;
+extern std::atomic<uint64_t> presentWaitNs;
+extern std::atomic<uint64_t> blitSwapNs;
+// Decode-side split of the GX drain (all recording-thread): geometry content hashing +
+// cache lookups, cache-miss vertex expansion (+ index build + ring/cache push), per-draw
+// pipeline/shader-info/bind-group construction, and per-draw uniform building.
+extern std::atomic<uint64_t> geomHashNs;
+extern std::atomic<uint64_t> geomExpandNs;
+extern std::atomic<uint64_t> drawCfgNs;
+extern std::atomic<uint64_t> drawUniNs;
+} // namespace perfstall
 extern gl::Buffer g_vertexBuffer;
 extern gl::Buffer g_uniformBuffer;
 extern gl::Buffer g_indexBuffer;
@@ -290,17 +309,20 @@ template <typename T>
 static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
-// Upload into the persistent native geometry cache buffers. Returns {range, true} on
-// success; {_, false} when the cache is exhausted (caller should fall back to the
-// per-frame ring and request a reset). Ranges are consumed by native-fetch draws with
-// DrawData::cachedGeometry set, which bind these buffers instead of the per-frame rings.
+// Upload into the active bank of the persistent native geometry cache buffers. Returns
+// {range, true} on success; {_, false} when that bank is exhausted (caller should fall
+// back to the per-frame ring and request a bank rotation). Ranges are consumed by
+// native-fetch draws with DrawData::cachedGeometry set, which bind these buffers instead
+// of the per-frame rings.
 std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length);
 std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t length);
-// Deferred reset of the native geometry cache; takes effect at the next begin_frame
-// (safe point: all prior frames referencing cached ranges have been submitted). Bumps
-// the generation counter so CPU-side content maps can drop their now-stale entries.
+// Deferred bank rotation of the native geometry cache; takes effect at the next
+// begin_frame. Only the bank selected for reuse becomes stale, while the other bank
+// remains hot. The generation counter lets CPU-side maps discard entries from the
+// recycled bank.
 void request_native_geometry_cache_reset() noexcept;
 uint32_t native_geom_cache_generation() noexcept;
+uint32_t native_geom_cache_bank() noexcept;
 Range push_uniform(const uint8_t* data, size_t length);
 template <typename T>
 static Range push_uniform(const T& data) {

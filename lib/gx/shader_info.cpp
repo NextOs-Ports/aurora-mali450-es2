@@ -27,7 +27,40 @@ Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
   return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
 }
 
-void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {
+void mark_raster_component(const ShaderConfig& config, const TevStage& stage, ShaderInfo& info,
+                           bool colorVector) {
+  if (stage.channelId == GX_COLOR_NULL || stage.channelId == GX_COLOR_ZERO ||
+      is_alpha_bump_channel(stage.channelId)) {
+    return;
+  }
+  const u32 channel = color_channel(stage.channelId);
+  const auto& swap = config.tevSwapTable[stage.tevSwapRas];
+  bool needsRgb = false;
+  bool needsAlpha = false;
+  const auto mark = [&](GXTevColorChan component) {
+    if (component == GX_CH_ALPHA) {
+      needsAlpha = true;
+    } else {
+      needsRgb = true;
+    }
+  };
+  if (colorVector) {
+    mark(swap.red);
+    mark(swap.green);
+    mark(swap.blue);
+  } else {
+    mark(swap.alpha);
+  }
+  info.sampledColorChannels.set(channel);
+  if (needsRgb) {
+    info.sampledColorChannelRgb.set(channel);
+  }
+  if (needsAlpha) {
+    info.sampledColorChannelAlpha.set(channel);
+  }
+}
+
+void color_arg_reg_info(GXTevColorArg arg, const ShaderConfig& config, const TevStage& stage, ShaderInfo& info) {
   switch (arg) {
   case GX_CC_CPREV:
   case GX_CC_APREV:
@@ -61,11 +94,10 @@ void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& in
     info.sampledTextures.set(stage.texMapId);
     break;
   case GX_CC_RASC:
+    mark_raster_component(config, stage, info, true);
+    break;
   case GX_CC_RASA:
-    if (stage.channelId != GX_COLOR_NULL && stage.channelId != GX_COLOR_ZERO &&
-        !is_alpha_bump_channel(stage.channelId)) {
-      info.sampledColorChannels.set(color_channel(stage.channelId));
-    }
+    mark_raster_component(config, stage, info, false);
     break;
   case GX_CC_KONST:
     switch (stage.kcSel) {
@@ -106,7 +138,7 @@ void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& in
   }
 }
 
-void alpha_arg_reg_info(GXTevAlphaArg arg, const TevStage& stage, ShaderInfo& info) {
+void alpha_arg_reg_info(GXTevAlphaArg arg, const ShaderConfig& config, const TevStage& stage, ShaderInfo& info) {
   switch (arg) {
   case GX_CA_APREV:
     if (!info.writesTevReg.test(GX_TEVPREV)) {
@@ -135,10 +167,7 @@ void alpha_arg_reg_info(GXTevAlphaArg arg, const TevStage& stage, ShaderInfo& in
     info.sampledTextures.set(stage.texMapId);
     break;
   case GX_CA_RASA:
-    if (stage.channelId != GX_COLOR_NULL && stage.channelId != GX_COLOR_ZERO &&
-        !is_alpha_bump_channel(stage.channelId)) {
-      info.sampledColorChannels.set(color_channel(stage.channelId));
-    }
+    mark_raster_component(config, stage, info, false);
     break;
   case GX_CA_KONST:
     switch (stage.kaSel) {
@@ -198,24 +227,20 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
-  // 10 position matrices + 10 texture matrices. Normal matrices are added below iff usesNormals.
-  info.uniformSize += sizeof(Mat3x4<float>) * 20;
-  info.uniformSize += 16; // active PN matrix index + padding
-
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
     // Color pass
-    color_arg_reg_info(stage.colorPass.a, stage, info);
-    color_arg_reg_info(stage.colorPass.b, stage, info);
-    color_arg_reg_info(stage.colorPass.c, stage, info);
-    color_arg_reg_info(stage.colorPass.d, stage, info);
+    color_arg_reg_info(stage.colorPass.a, config, stage, info);
+    color_arg_reg_info(stage.colorPass.b, config, stage, info);
+    color_arg_reg_info(stage.colorPass.c, config, stage, info);
+    color_arg_reg_info(stage.colorPass.d, config, stage, info);
     info.writesTevReg.set(stage.colorOp.outReg);
 
     // Alpha pass
-    alpha_arg_reg_info(stage.alphaPass.a, stage, info);
-    alpha_arg_reg_info(stage.alphaPass.b, stage, info);
-    alpha_arg_reg_info(stage.alphaPass.c, stage, info);
-    alpha_arg_reg_info(stage.alphaPass.d, stage, info);
+    alpha_arg_reg_info(stage.alphaPass.a, config, stage, info);
+    alpha_arg_reg_info(stage.alphaPass.b, config, stage, info);
+    alpha_arg_reg_info(stage.alphaPass.c, config, stage, info);
+    alpha_arg_reg_info(stage.alphaPass.d, config, stage, info);
     if (!info.writesTevReg.test(stage.alphaOp.outReg)) {
       // If we're writing alpha to a register that's not been
       // written to in the shader, load from uniform buffer
@@ -269,13 +294,67 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
+  // Most HSF draws select one position matrix with GXSetCurrentMtx and use
+  // zero or one statically selected texture matrix. Compact both palettes for
+  // classic GLES uniforms. A live per-vertex texture-matrix index can address
+  // the combined 20-matrix GX palette, so preserve the full contiguous layout
+  // for that uncommon path.
+#ifdef AURORA_GLES2
+  bool needsFullPnPalette = info.indexAttr.test(GX_VA_PNMTXIDX);
+  bool needsFullTexPalette = false;
+  for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
+    if (!info.sampledTexCoords.test(i)) {
+      continue;
+    }
+    const auto& tcg = config.tcgs[i];
+    if (tcg.type != GX_TG_MTX2x4 && tcg.type != GX_TG_MTX3x4) {
+      continue;
+    }
+    if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+      needsFullPnPalette = true;
+      needsFullTexPalette = true;
+      continue;
+    }
+    if (tcg.mtx == GX_IDENTITY) {
+      continue;
+    }
+    const u32 mtxIdx = static_cast<u32>(tcg.mtx) / 3;
+    if (mtxIdx < MaxPnMtx) {
+      needsFullPnPalette = true;
+    } else if (mtxIdx < MaxPnMtx + MaxTexMtx) {
+      info.usedTexMtxs.set(mtxIdx - MaxPnMtx);
+    }
+  }
+  info.pnMtxCount = needsFullPnPalette ? MaxPnMtx : 1;
+  if (needsFullTexPalette) {
+    info.usedTexMtxs.set();
+  }
+#else
+  info.pnMtxCount = MaxPnMtx;
+  info.usedTexMtxs.set();
+#endif
+  info.uniformSize +=
+      sizeof(Mat3x4<float>) * (info.pnMtxCount + info.usedTexMtxs.count());
+  info.uniformSize += 16; // active PN matrix index + padding
+
   info.uniformSize += info.loadsTevReg.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
       const auto& cc = config.colorChannels[i];
       const auto& cca = config.colorChannels[i + GX_ALPHA0];
-      if (cc.lightingEnabled || cca.lightingEnabled) {
-        info.lightingEnabled = true;
+      if (info.sampledColorChannelRgb.test(i) && cc.lightingEnabled) {
+        if (cc.diffFn == GX_DF_NONE && cc.attnFn == GX_AF_NONE) {
+          info.precomputedLightChannels.set(i);
+        } else {
+          info.lightingEnabled = true;
+        }
+      }
+      if (info.sampledColorChannelAlpha.test(i) && cca.lightingEnabled) {
+        if (cca.diffFn == GX_DF_NONE && cca.attnFn == GX_AF_NONE) {
+          info.precomputedLightChannels.set(i + GX_ALPHA0);
+        } else {
+          info.lightingEnabled = true;
+        }
       }
     }
   }
@@ -284,27 +363,32 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   // them, so gate the 480B palette here (lightingEnabled is fully resolved by this point).
   info.usesNormals = info.lightingEnabled || EnableNormalVisualization;
   if (info.usesNormals) {
-    info.uniformSize += sizeof(Mat3x4<float>) * MaxPnMtx;
+    info.uniformSize += sizeof(Mat3x4<float>) * info.pnMtxCount;
   }
   if (info.lightingEnabled) {
     // Lights + light state for all channels
     info.uniformSize += 16 + sizeof(Light) * GX::MaxLights;
   }
+  info.uniformSize += info.precomputedLightChannels.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
       const auto& cc = config.colorChannels[i];
-      if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
-      }
-      if (cc.matSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
+      if (info.sampledColorChannelRgb.test(i)) {
+        if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
+          info.uniformSize += sizeof(Vec4<float>);
+        }
+        if (cc.matSrc == GX_SRC_REG) {
+          info.uniformSize += sizeof(Vec4<float>);
+        }
       }
       const auto& cca = config.colorChannels[i + GX_ALPHA0];
-      if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
-      }
-      if (cca.matSrc == GX_SRC_REG) {
-        info.uniformSize += sizeof(Vec4<float>);
+      if (info.sampledColorChannelAlpha.test(i)) {
+        if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
+          info.uniformSize += sizeof(Vec4<float>);
+        }
+        if (cca.matSrc == GX_SRC_REG) {
+          info.uniformSize += sizeof(Vec4<float>);
+        }
       }
     }
   }
@@ -426,17 +510,27 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   }
   buf.append(g_gxState.proj);
 
-  for (int i = 0; i < MaxPnMtx; i++) {
-    buf.append(g_gxState.pnMtx[i].pos);
+  if (info.pnMtxCount == 1) {
+    buf.append(g_gxState.pnMtx[g_gxState.currentPnMtx].pos);
+  } else {
+    for (int i = 0; i < MaxPnMtx; i++) {
+      buf.append(g_gxState.pnMtx[i].pos);
+    }
   }
 
-  for (int i = 0; i < MaxTexMtx; i++) {
-    buf.append(g_gxState.texMtxs[i]);
+  for (int i = 0; i < info.usedTexMtxs.size(); ++i) {
+    if (info.usedTexMtxs.test(i)) {
+      buf.append(g_gxState.texMtxs[i]);
+    }
   }
 
   if (info.usesNormals) {
-    for (int i = 0; i < MaxPnMtx; i++) {
-      buf.append(g_gxState.pnMtx[i].nrm);
+    if (info.pnMtxCount == 1) {
+      buf.append(g_gxState.pnMtx[g_gxState.currentPnMtx].nrm);
+    } else {
+      for (int i = 0; i < MaxPnMtx; i++) {
+        buf.append(g_gxState.pnMtx[i].nrm);
+      }
     }
   }
 
@@ -464,19 +558,41 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     }
     const auto& ccc = g_gxState.colorChannelConfig[i];
     const auto& ccs = g_gxState.colorChannelState[i];
-    if (ccc.lightingEnabled && ccc.ambSrc == GX_SRC_REG) {
-      buf.append(ccs.ambColor);
-    }
-    if (ccc.matSrc == GX_SRC_REG) {
-      buf.append(ccs.matColor);
+    if (info.sampledColorChannelRgb.test(i)) {
+      if (info.precomputedLightChannels.test(i)) {
+        Vec4<float> lightSum{};
+        for (u32 li = 0; li < GX::MaxLights; ++li) {
+          if (ccs.lightMask.test(li)) {
+            lightSum = lightSum + g_gxState.lights[li].color;
+          }
+        }
+        buf.append(lightSum);
+      }
+      if (ccc.lightingEnabled && ccc.ambSrc == GX_SRC_REG) {
+        buf.append(ccs.ambColor);
+      }
+      if (ccc.matSrc == GX_SRC_REG) {
+        buf.append(ccs.matColor);
+      }
     }
     const auto& ccca = g_gxState.colorChannelConfig[i + GX_ALPHA0];
     const auto& ccsa = g_gxState.colorChannelState[i + GX_ALPHA0];
-    if (ccca.lightingEnabled && ccca.ambSrc == GX_SRC_REG) {
-      buf.append(ccsa.ambColor);
-    }
-    if (ccca.matSrc == GX_SRC_REG) {
-      buf.append(ccsa.matColor);
+    if (info.sampledColorChannelAlpha.test(i)) {
+      if (info.precomputedLightChannels.test(i + GX_ALPHA0)) {
+        Vec4<float> lightSum{};
+        for (u32 li = 0; li < GX::MaxLights; ++li) {
+          if (ccsa.lightMask.test(li)) {
+            lightSum = lightSum + g_gxState.lights[li].color;
+          }
+        }
+        buf.append(lightSum);
+      }
+      if (ccca.lightingEnabled && ccca.ambSrc == GX_SRC_REG) {
+        buf.append(ccsa.ambColor);
+      }
+      if (ccca.matSrc == GX_SRC_REG) {
+        buf.append(ccsa.matColor);
+      }
     }
   }
   for (int i = 0; i < info.sampledKColors.size(); ++i) {

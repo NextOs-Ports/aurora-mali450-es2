@@ -830,6 +830,15 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   if (!cc.lightingEnabled) {
     return fmt::format("\n    {0}{2} = {1}{2};", outVar, matSrc, swizzle);
   }
+  if (cc.diffFn == GX_DF_NONE && cc.attnFn == GX_AF_NONE) {
+    const auto lightSum = fmt::format("ubuf.cc{0}{1}_light", i, alpha ? "a"sv : ""sv);
+    return fmt::format(R"""(
+    {{
+      vec4 lighting = {0} + {1};
+      {2}{3} = ({4} * clamp(lighting, vec4(0.0), vec4(1.0))){3};
+    }})""",
+                       ambSrc, lightSum, outVar, swizzle, matSrc);
+  }
   GXDiffuseFn diffFn = cc.diffFn;
   std::string lightAttnFn;
   if (cc.attnFn == GX_AF_NONE) {
@@ -859,22 +868,40 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   } else if (diffFn == GX_DF_CLAMP) {
     lightDiffFn = "max(0.0, dot(ldir, mv_nrm))"sv;
   }
+  // GX_AF_SPEC with GX_DF_NONE only uses L to decide which side of the
+  // surface the light lies on. Normalizing L cannot change that sign, and the
+  // generated sqrt/divide was being paid once per enabled light on Mali-450.
+  // Spot attenuation still needs both normalized L and its distance; diffuse
+  // lighting needs normalized L for N.L.
+  std::string lightVectorSetup;
+  if (cc.attnFn == GX_AF_SPOT) {
+    lightVectorSetup = fmt::format(R"""(
+          vec3 ldir = light.pos - {0};
+          float dist2 = dot(ldir, ldir);
+          float dist = sqrt(dist2);
+          ldir = ldir / dist;)""",
+                                   posVar);
+  } else if (diffFn != GX_DF_NONE) {
+    lightVectorSetup = fmt::format(R"""(
+          vec3 ldir = normalize(light.pos - {0});)""",
+                                   posVar);
+  } else {
+    lightVectorSetup = fmt::format(R"""(
+          vec3 ldir = light.pos - {0};)""",
+                                   posVar);
+  }
 #ifdef AURORA_GLES2
   std::string lightSteps;
   const auto maskName = fmt::format("ubuf.lightState{}{}", i, alpha ? "a"sv : ""sv);
   for (u32 li = 0; li < GX::MaxLights; ++li) {
     lightSteps += fmt::format(R"""(
       if (mod(floor({0} / {1}.0), 2.0) >= 1.0) {{
-          Light light = raw_light{2}();
-          vec3 ldir = light.pos - {3};
-          float dist2 = dot(ldir, ldir);
-          float dist = sqrt(dist2);
-          ldir = ldir / dist;
+          Light light = raw_light{2}();{3}
           float attn;{4}
           float diff = {5};
           lighting = lighting + (attn * diff * light.color);
       }})""",
-                              maskName, 1u << li, li, posVar, lightAttnFn, lightDiffFn);
+                              maskName, 1u << li, li, lightVectorSetup, lightAttnFn, lightDiffFn);
   }
   return fmt::format(R"""(
     {{
@@ -888,18 +915,14 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
       vec4 lighting = {5};
       for (uint li = 0u; li < {1}u; li++) {{
           if ((ubuf.lightState{0}{9} & (1u << li)) == 0u) {{ continue; }}
-          Light light = ubuf.lights[li];
-          vec3 ldir = light.pos - {6};
-          float dist2 = dot(ldir, ldir);
-          float dist = sqrt(dist2);
-          ldir = ldir / dist;
+          Light light = ubuf.lights[li];{6}
           float attn;{2}
           float diff = {3};
           lighting = lighting + (attn * diff * light.color);
       }}
       {7}{8} = ({4} * clamp(lighting, vec4(0.0), vec4(1.0))){8};
     }})""",
-                     i, GX::MaxLights, lightAttnFn, lightDiffFn, matSrc, ambSrc, posVar, outVar, swizzle,
+                     i, GX::MaxLights, lightAttnFn, lightDiffFn, matSrc, ambSrc, lightVectorSetup, outVar, swizzle,
                      alpha ? "a"sv : ""sv);
 #endif
 }
@@ -984,10 +1007,17 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   const u32 rawProj = rawCursor;
   rawCursor += 4;
   const u32 rawPostex = rawCursor;
-  rawCursor += (MaxPnMtx + MaxTexMtx) * 3;
+  rawCursor += info.pnMtxCount * 3;
+  std::array<u32, MaxTexMtx> rawTexMtx{};
+  for (u32 i = 0; i < info.usedTexMtxs.size(); ++i) {
+    if (info.usedTexMtxs.test(i)) {
+      rawTexMtx[i] = rawCursor;
+      rawCursor += 3;
+    }
+  }
   const u32 rawNrm = rawCursor;
   if (info.usesNormals) {
-    rawCursor += MaxPnMtx * 3;
+    rawCursor += info.pnMtxCount * 3;
   }
   for (u32 i = 0; i < info.loadsTevReg.size(); ++i) {
     if (info.loadsTevReg.test(i)) {
@@ -1019,17 +1049,27 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     const auto& cc = config.colorChannels[i];
     const auto& cca = config.colorChannels[i + GX_ALPHA0];
-    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
-      rawReplacements.emplace_back(fmt::format("ubuf.cc{}_amb", i), raw(rawCursor++));
+    if (info.sampledColorChannelRgb.test(i)) {
+      if (info.precomputedLightChannels.test(i)) {
+        rawReplacements.emplace_back(fmt::format("ubuf.cc{}_light", i), raw(rawCursor++));
+      }
+      if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
+        rawReplacements.emplace_back(fmt::format("ubuf.cc{}_amb", i), raw(rawCursor++));
+      }
+      if (cc.matSrc == GX_SRC_REG) {
+        rawReplacements.emplace_back(fmt::format("ubuf.cc{}_mat", i), raw(rawCursor++));
+      }
     }
-    if (cc.matSrc == GX_SRC_REG) {
-      rawReplacements.emplace_back(fmt::format("ubuf.cc{}_mat", i), raw(rawCursor++));
-    }
-    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
-      rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_amb", i), raw(rawCursor++));
-    }
-    if (cca.matSrc == GX_SRC_REG) {
-      rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_mat", i), raw(rawCursor++));
+    if (info.sampledColorChannelAlpha.test(i)) {
+      if (info.precomputedLightChannels.test(i + GX_ALPHA0)) {
+        rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_light", i), raw(rawCursor++));
+      }
+      if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
+        rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_amb", i), raw(rawCursor++));
+      }
+      if (cca.matSrc == GX_SRC_REG) {
+        rawReplacements.emplace_back(fmt::format("ubuf.cc{}a_mat", i), raw(rawCursor++));
+      }
     }
   }
   for (u32 i = 0; i < info.sampledKColors.size(); ++i) {
@@ -1121,10 +1161,13 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
 #endif
   }
 #ifdef AURORA_GLES2
+  const std::string rawPnMtx =
+      info.pnMtxCount == 1 ? fmt::format("{}", rawPostex)
+                           : fmt::format("{} + int(in_pnmtxidx) * 3", rawPostex);
   vsBody += fmt::format(
-      "\n    vec3 mv_pos = raw_mul3x4(vec4({0}, 1.0), {1} + int(in_pnmtxidx) * 3);"
+      "\n    vec3 mv_pos = raw_mul3x4(vec4({0}, 1.0), {1});"
       "\n    gl_Position = vec4(mv_pos, 1.0) * raw_mat4({2});",
-      vtx_attr(config, GX_VA_POS), rawPostex, rawProj);
+      vtx_attr(config, GX_VA_POS), rawPnMtx, rawProj);
 #else
   vsBody += fmt::format(
       "\n    vec3 mv_pos = vec4({0}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
@@ -1141,10 +1184,13 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   vsBody += "\n    gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;";
   if (info.usesNormals) {
 #ifdef AURORA_GLES2
+    const std::string rawNrmMtx =
+        info.pnMtxCount == 1 ? fmt::format("{}", rawNrm)
+                             : fmt::format("{} + int(in_pnmtxidx) * 3", rawNrm);
     vsBody += fmt::format(
-        "\n    vec3 nrm_tmp = raw_mul3x4(vec4({0}, 0.0), {1} + int(in_pnmtxidx) * 3);"
+        "\n    vec3 nrm_tmp = raw_mul3x4(vec4({0}, 0.0), {1});"
         "\n    vec3 mv_nrm = (dot(nrm_tmp, nrm_tmp) > 1e-10) ? normalize(nrm_tmp) : nrm_tmp;",
-        vtx_attr(config, GX_VA_NRM), rawNrm);
+        vtx_attr(config, GX_VA_NRM), rawNrmMtx);
 #else
     vsBody += fmt::format(
         "\n    vec3 nrm_tmp = vec4({0}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
@@ -1246,21 +1292,35 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     const auto& cc = config.colorChannels[i];
     const auto& cca = config.colorChannels[i + GX_ALPHA0];
-    if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
-      uniformFields += fmt::format("\n    vec4 cc{0}_amb;", i);
+    if (info.sampledColorChannelRgb.test(i)) {
+      if (info.precomputedLightChannels.test(i)) {
+        uniformFields += fmt::format("\n    vec4 cc{0}_light;", i);
+      }
+      if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
+        uniformFields += fmt::format("\n    vec4 cc{0}_amb;", i);
+      }
+      if (cc.matSrc == GX_SRC_REG) {
+        uniformFields += fmt::format("\n    vec4 cc{0}_mat;", i);
+      }
     }
-    if (cc.matSrc == GX_SRC_REG) {
-      uniformFields += fmt::format("\n    vec4 cc{0}_mat;", i);
-    }
-    if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
-      uniformFields += fmt::format("\n    vec4 cc{0}a_amb;", i);
-    }
-    if (cca.matSrc == GX_SRC_REG) {
-      uniformFields += fmt::format("\n    vec4 cc{0}a_mat;", i);
+    if (info.sampledColorChannelAlpha.test(i)) {
+      if (info.precomputedLightChannels.test(i + GX_ALPHA0)) {
+        uniformFields += fmt::format("\n    vec4 cc{0}a_light;", i);
+      }
+      if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
+        uniformFields += fmt::format("\n    vec4 cc{0}a_amb;", i);
+      }
+      if (cca.matSrc == GX_SRC_REG) {
+        uniformFields += fmt::format("\n    vec4 cc{0}a_mat;", i);
+      }
     }
     addVarying("vec4", fmt::format("v_cc{}", i));
-    vsBody += lighting_func(config, cc, i, false);
-    vsBody += lighting_func(config, cca, i, true);
+    if (info.sampledColorChannelRgb.test(i)) {
+      vsBody += lighting_func(config, cc, i, false);
+    }
+    if (info.sampledColorChannelAlpha.test(i)) {
+      vsBody += lighting_func(config, cca, i, true);
+    }
     fsPre += fmt::format("\n    vec4 rast{0} = v_cc{0};", i);
   }
   for (int i = 0; i < info.sampledKColors.size(); ++i) {
@@ -1283,12 +1343,15 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     if (is_emboss_texgen(tcg.type)) {
       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
 #ifdef AURORA_GLES2
+      const std::string rawEmbossNrm =
+          info.pnMtxCount == 1 ? fmt::format("{}", rawNrm)
+                               : fmt::format("{} + int(in_pnmtxidx) * 3", rawNrm);
       vsBody += fmt::format(
           "\n    vec3 bump_ldir{0} = normalize(u_data[{1}].xyz - mv_pos);"
-          "\n    vec3 bump_tan{0} = raw_mul3x4(vec4(in_tangent, 0.0), {2} + int(in_pnmtxidx) * 3);"
-          "\n    vec3 bump_bin{0} = raw_mul3x4(vec4(in_binrm, 0.0), {2} + int(in_pnmtxidx) * 3);"
+          "\n    vec3 bump_tan{0} = raw_mul3x4(vec4(in_tangent, 0.0), {2});"
+          "\n    vec3 bump_bin{0} = raw_mul3x4(vec4(in_binrm, 0.0), {2});"
           "\n    v_tex{0}_uv = tc{3}_proj.xy + vec2(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, bump_bin{0}));",
-          i, rawLights + lightIdx * 5, rawNrm, tcg.embossSrc);
+          i, rawLights + lightIdx * 5, rawEmbossNrm, tcg.embossSrc);
 #else
       vsBody += fmt::format(
           "\n    vec3 bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
@@ -1330,7 +1393,10 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       } else {
         u32 texMtxIdx = (tcg.mtx) / 3;
 #ifdef AURORA_GLES2
-        vsBody += fmt::format("\n    vec3 tc{0}_tmp = raw_mul3x4(tc{0}, {1});", i, rawPostex + texMtxIdx * 3);
+        const u32 rawStaticTexMtx =
+            texMtxIdx < MaxPnMtx ? rawPostex + texMtxIdx * 3
+                                 : rawTexMtx[texMtxIdx - MaxPnMtx];
+        vsBody += fmt::format("\n    vec3 tc{0}_tmp = raw_mul3x4(tc{0}, {1});", i, rawStaticTexMtx);
 #else
         vsBody += fmt::format("\n    vec3 tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
 #endif

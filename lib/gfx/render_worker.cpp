@@ -1,4 +1,5 @@
 #include "render_worker.hpp"
+#include "common.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -89,7 +90,17 @@ BoundedQueue::BoundedQueue(size_t capacity) : m_capacity(capacity) {}
 bool BoundedQueue::push(QueueItem item) {
   ZoneScoped;
   std::unique_lock lock{m_mutex};
-  m_notFull.wait(lock, [&] { return m_closed || m_items.size() < m_capacity; });
+  if (!m_closed && m_items.size() >= m_capacity) {
+    // Backpressure: the recording thread outran the worker. Only this slow path pays for
+    // clock reads; the accumulated wait feeds the [fps] stall split.
+    const auto waitStart = std::chrono::steady_clock::now();
+    m_notFull.wait(lock, [&] { return m_closed || m_items.size() < m_capacity; });
+    perfstall::queueWaitNs.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count(),
+        std::memory_order_relaxed);
+  } else {
+    m_notFull.wait(lock, [&] { return m_closed || m_items.size() < m_capacity; });
+  }
   if (m_closed) {
     return false;
   }

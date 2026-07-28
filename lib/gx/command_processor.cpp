@@ -18,12 +18,31 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <vector>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
+
+// Dirty markers backing the native-draw memo (see push_native_gx_draw). Every state
+// write marks the coarse stateDirty exactly as before; the classification below only
+// adds information. mark_dirty_all is the conservative default for any pipeline-config
+// input. mark_dirty_tex is for texture/TLUT bind data (bind groups + texture resolve
+// only). mark_dirty_uniform is reserved for writes that feed build_uniform values
+// exclusively (XF matrices/lights, TEV register colors, fog params, point/line sizes,
+// the current PN matrix index) — they leave the memoized pipeline/bind groups valid.
+static inline void mark_dirty_all() {
+  g_gxState.stateDirty = true;
+  g_gxState.pipelineStateDirty = true;
+  g_gxState.texStateDirty = true;
+}
+static inline void mark_dirty_tex() {
+  g_gxState.stateDirty = true;
+  g_gxState.texStateDirty = true;
+}
+static inline void mark_dirty_uniform() { g_gxState.stateDirty = true; }
 
 // Bumped by GX_CMD_INVL_VC (GXInvalidateVtxCache); invalidates the memoized attribute
 // array content hashes the native geometry cache keys indexed draws by.
@@ -290,7 +309,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     for (u32 i = 0; i < len; i++) {
       flat[i] = read_f32(data + i * 4, bigEndian);
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
   } else if (addr < 0x0F0) {
     // Texture matrices (0x078-0x0EF)
     u32 texBase = addr - 0x078;
@@ -306,7 +325,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     for (u32 i = 0; i < len; i++) {
       flat[i] = read_f32(data + i * 4, bigEndian);
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     return true;
   } else if (addr >= 0x400 && addr < 0x45A) {
     // Normal matrices (0x400-0x459)
@@ -326,7 +345,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
         flat[row * 4 + col] = read_f32(data + i * 4, bigEndian);
       }
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     return true;
   } else if (addr >= 0x500 && addr < 0x5F0) {
     // Post-transform texture matrices (0x500-0x5EF)
@@ -340,7 +359,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     for (u32 i = 0; i < len; i++) {
       flat[startOffset + i] = read_f32(data + i * 4, bigEndian);
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     return true;
   } else if (addr >= 0x600 && addr < 0x680) {
     // Lights (0x600-0x67F) - 8 lights, 16 values each
@@ -399,13 +418,14 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
         break; // padding (0-2)
       }
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     return true;
   }
   return false;
 }
 
 // Forward declarations for register handlers
+static void invalidate_native_draw_memo();
 static void handle_bp(u32 value, bool bigEndian);
 static void handle_cp(u8 addr, u32 value, bool bigEndian);
 static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian);
@@ -414,6 +434,9 @@ static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 
 void process(const u8* data, u32 size, bool bigEndian) {
   ZoneScoped;
+  // Refs cached by the draw memo must never outlive the frame (bind-group cache
+  // entries expire between frames); each process() batch starts from scratch.
+  invalidate_native_draw_memo();
   u32 pos = 0;
 
   while (pos < size) {
@@ -572,7 +595,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         s.colorOp.bias = static_cast<GXTevBias>(bp_get(value, 2, 16));
         s.colorOp.scale = static_cast<GXTevScale>(bp_get(value, 2, 20));
       }
-      g_gxState.stateDirty = true;
+      mark_dirty_all();
     }
     return;
   }
@@ -600,7 +623,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         s.alphaOp.bias = static_cast<GXTevBias>(bp_get(value, 2, 16));
         s.alphaOp.scale = static_cast<GXTevScale>(bp_get(value, 2, 20));
       }
-      g_gxState.stateDirty = true;
+      mark_dirty_all();
     }
     return;
   }
@@ -625,7 +648,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       break;
     }
     g_gxState.numIndStages = bp_get(value, 3, 16);
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -665,7 +688,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       s.indTexWrapT = static_cast<GXIndTexWrap>(bp_get(value, 3, 16));
       s.indTexUseOrigLOD = bp_get(value, 1, 19) != 0;
       s.indTexAddPrev = bp_get(value, 1, 20) != 0;
-      g_gxState.stateDirty = true;
+      mark_dirty_all();
     }
     break;
   }
@@ -692,7 +715,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.lineTexOffset = static_cast<GXTexOffset>(bp_get(value, 3, 16));
     g_gxState.pointTexOffset = static_cast<GXTexOffset>(bp_get(value, 3, 19));
     g_gxState.lineHalfAspect = bp_get(value, 1, 22) != 0;
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
 
@@ -706,7 +729,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.indStages[1].scaleS = static_cast<GXIndTexScale>(bp_get(value, 4, 8));
       g_gxState.indStages[1].scaleT = static_cast<GXIndTexScale>(bp_get(value, 4, 12));
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
   case 0x26: {
@@ -718,7 +741,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.indStages[3].scaleS = static_cast<GXIndTexScale>(bp_get(value, 4, 8));
       g_gxState.indStages[3].scaleT = static_cast<GXIndTexScale>(bp_get(value, 4, 12));
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -728,7 +751,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.indStages[i].texMapId = static_cast<GXTexMapID>(bp_get(value, 3, i * 6));
       g_gxState.indStages[i].texCoordId = static_cast<GXTexCoordID>(bp_get(value, 3, i * 6 + 3));
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -770,7 +793,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       u32 chanHw = bp_get(value, 3, 19);
       s.channelId = (chanHw < 8) ? r2c[chanHw] : GX_COLOR_NULL;
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -779,7 +802,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.depthCompare = bp_get(value, 1, 0) != 0;
     g_gxState.depthFunc = static_cast<GXCompare>(bp_get(value, 3, 1));
     g_gxState.depthUpdate = bp_get(value, 1, 4) != 0;
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -804,7 +827,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     } else {
       g_gxState.blendMode = GX_BM_NONE;
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -814,7 +837,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     bool enabled = bp_get(value, 1, 8) != 0;
     g_gxState.dstAlpha = enabled ? alpha : UINT32_MAX;
     g_gxState.pixelFmt = decode_pixel_fmt(g_gxState.bpRegCache[0x43], value);
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -823,7 +846,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.pixelFmt = decode_pixel_fmt(value, g_gxState.bpRegCache[0x42]);
     g_gxState.zFmt = static_cast<GXZFmt16>(bp_get(value, 3, 3));
     g_gxState.zCompLocBeforeTex = bp_get(value, 1, 6) != 0;
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -858,7 +881,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     g_gxState.alphaCompare.comp0 = static_cast<GXCompare>(bp_get(value, 3, 16));
     g_gxState.alphaCompare.comp1 = static_cast<GXCompare>(bp_get(value, 3, 19));
     g_gxState.alphaCompare.op = static_cast<GXAlphaOp>(bp_get(value, 2, 22));
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -894,7 +917,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       g_gxState.tevStages[stage1].kcSel = static_cast<GXTevKColorSel>(bp_get(value, 5, 14));
       g_gxState.tevStages[stage1].kaSel = static_cast<GXTevKAlphaSel>(bp_get(value, 5, 19));
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -911,7 +934,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     std::memcpy(&a_encoded, &a_bits, sizeof(a_encoded));
     u32 b_s = g_gxState.fog.fog2Raw & 0x1F;
     g_gxState.fog.a = std::ldexp(a_encoded, static_cast<int>(b_s));
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
   // FOG1 (0xEF): B mantissa (24-bit)
@@ -921,7 +944,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 b_s = g_gxState.fog.fog2Raw & 0x1F;
     float B_mant = static_cast<float>(b_m) / 8388638.0f;
     g_gxState.fog.b = std::ldexp(B_mant, static_cast<int>(b_s) - 1);
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
   // FOG2 (0xF0): B shift/exponent (5-bit)
@@ -940,7 +963,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 b_m = bp_get(g_gxState.fog.fog1Raw, 24, 0);
     float B_mant = static_cast<float>(b_m) / 8388638.0f;
     g_gxState.fog.b = std::ldexp(B_mant, static_cast<int>(b_s) - 1);
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
 
@@ -954,7 +977,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u32 c_sign = bp_get(value, 1, 19);
     u32 c_bits = (c_sign << 31) | (c_exp << 23) | (c_mant << 12);
     std::memcpy(&g_gxState.fog.c, &c_bits, sizeof(g_gxState.fog.c));
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -969,7 +992,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         static_cast<float>(b) / 255.f,
         1.f,
     };
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
 
@@ -1000,7 +1023,7 @@ static void handle_bp(u32 value, bool bigEndian) {
           kc[2] = static_cast<float>(bp_get(value, 8, 0)) / 255.f;  // B
           kc[1] = static_cast<float>(bp_get(value, 8, 12)) / 255.f; // G
         }
-        g_gxState.stateDirty = true;
+        mark_dirty_uniform();
       }
     } else {
       // TEV color register (11-bit signed components)
@@ -1026,7 +1049,7 @@ static void handle_bp(u32 value, bool bigEndian) {
           cr[2] = static_cast<float>(b) / 255.f;
           cr[1] = static_cast<float>(g) / 255.f;
         }
-        g_gxState.stateDirty = true;
+        mark_dirty_uniform();
       }
     }
     break;
@@ -1072,7 +1095,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     }
     info.scaleExp = static_cast<s8>(info.adjScaleRaw) - 17;
 
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -1109,7 +1132,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       tcs.lineOffset = bp_get(value, 1, 18) != 0;
       tcs.pointOffset = bp_get(value, 1, 19) != 0;
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     break;
   }
 
@@ -1119,7 +1142,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     u8 a = bp_get(value, 8, 8);
     g_gxState.clearColor[0] = static_cast<float>(r) / 255.f;
     g_gxState.clearColor[3] = static_cast<float>(a) / 255.f;
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
   case 0x50: {
@@ -1127,12 +1150,12 @@ static void handle_bp(u32 value, bool bigEndian) {
     u8 g = bp_get(value, 8, 8);
     g_gxState.clearColor[2] = static_cast<float>(b) / 255.f;
     g_gxState.clearColor[1] = static_cast<float>(g) / 255.f;
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
   case 0x51: {
     g_gxState.clearDepth = bp_get(value, 24, 0);
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
 
@@ -1163,7 +1186,7 @@ static void handle_bp(u32 value, bool bigEndian) {
         // GXTexRegion regs
         break;
       }
-      g_gxState.stateDirty = true;
+      mark_dirty_tex();
     } else {
 #ifndef NDEBUG
       Log.debug("Unhandled BP register 0x{:02X} (value 0x{:06X})", regId, value & 0xFFFFFF);
@@ -1192,7 +1215,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
     vd[GX_VA_NRM] = static_cast<GXAttrType>(bp_get(value, 2, 11));
     vd[GX_VA_CLR0] = static_cast<GXAttrType>(bp_get(value, 2, 13));
     vd[GX_VA_CLR1] = static_cast<GXAttrType>(bp_get(value, 2, 15));
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     g_gxState.clearVtxSizeCache();
     break;
   }
@@ -1208,7 +1231,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
     vd[GX_VA_TEX5] = static_cast<GXAttrType>(bp_get(value, 2, 10));
     vd[GX_VA_TEX6] = static_cast<GXAttrType>(bp_get(value, 2, 12));
     vd[GX_VA_TEX7] = static_cast<GXAttrType>(bp_get(value, 2, 14));
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
     g_gxState.clearVtxSizeCache();
     break;
   }
@@ -1216,7 +1239,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
   // Matrix index A (0x30)
   case 0x30: {
     g_gxState.currentPnMtx = bp_get(value, 6, 0) / 3;
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
     break;
   }
 
@@ -1253,7 +1276,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       vf.attrs[GX_VA_TEX0].cnt = static_cast<GXCompCnt>(bp_get(value, 1, 21));
       vf.attrs[GX_VA_TEX0].type = static_cast<GXCompType>(bp_get(value, 3, 22));
       vf.attrs[GX_VA_TEX0].frac = static_cast<u8>(bp_get(value, 5, 25));
-      g_gxState.stateDirty = true;
+      mark_dirty_all();
       g_gxState.clearVtxSizeCache();
     }
     // VAT B registers (0x80-0x87)
@@ -1272,7 +1295,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       vf.attrs[GX_VA_TEX4].cnt = static_cast<GXCompCnt>(bp_get(value, 1, 27));
       vf.attrs[GX_VA_TEX4].type = static_cast<GXCompType>(bp_get(value, 3, 28));
       // TEX4 frac is in VAT C
-      g_gxState.stateDirty = true;
+      mark_dirty_all();
       g_gxState.clearVtxSizeCache();
     }
     // VAT C registers (0x90-0x97)
@@ -1289,7 +1312,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       vf.attrs[GX_VA_TEX7].cnt = static_cast<GXCompCnt>(bp_get(value, 1, 23));
       vf.attrs[GX_VA_TEX7].type = static_cast<GXCompType>(bp_get(value, 3, 24));
       vf.attrs[GX_VA_TEX7].frac = static_cast<u8>(bp_get(value, 5, 27));
-      g_gxState.stateDirty = true;
+      mark_dirty_all();
       g_gxState.clearVtxSizeCache();
     }
     // Array base addresses (0xA0-0xAF)
@@ -1304,7 +1327,7 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
         const auto newStride = static_cast<u8>(value);
         if (array.stride != newStride) {
           array.stride = newStride;
-          g_gxState.stateDirty = true;
+          mark_dirty_all();
         }
       }
     }
@@ -1348,31 +1371,31 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
       case 0x09:
         // numChans
         g_gxState.numChans = val;
-        g_gxState.stateDirty = true;
+        mark_dirty_all();
         break;
       case 0x0A:
         // Ambient color 0
         g_gxState.colorChannelState[GX_COLOR0].ambColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA0].ambColor = unpack_color(val);
-        g_gxState.stateDirty = true;
+        mark_dirty_uniform();
         break;
       case 0x0B:
         // Ambient color 1
         g_gxState.colorChannelState[GX_COLOR1].ambColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA1].ambColor = unpack_color(val);
-        g_gxState.stateDirty = true;
+        mark_dirty_uniform();
         break;
       case 0x0C:
         // Material color 0
         g_gxState.colorChannelState[GX_COLOR0].matColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA0].matColor = unpack_color(val);
-        g_gxState.stateDirty = true;
+        mark_dirty_uniform();
         break;
       case 0x0D:
         // Material color 1
         g_gxState.colorChannelState[GX_COLOR1].matColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA1].matColor = unpack_color(val);
-        g_gxState.stateDirty = true;
+        mark_dirty_uniform();
         break;
       case 0x0E:
       case 0x0F:
@@ -1400,7 +1423,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
           }
           u32 lightMask = lightsLo | (lightsHi << 4);
           g_gxState.colorChannelState[chanId].lightMask = GX::LightMask{lightMask};
-          g_gxState.stateDirty = true;
+          mark_dirty_all();
         }
         break;
       }
@@ -1412,7 +1435,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
           assert(texMtx >= 0 && texMtx <= GXTexMtx::GX_IDENTITY);
           g_gxState.tcgs[i].mtx = texMtx;
         }
-        g_gxState.stateDirty = true;
+        mark_dirty_all();
         break;
       }
       case 0x19: {
@@ -1420,7 +1443,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
         for (u32 i = 0; i < 4 && (i + 4) < MaxTexCoord; i++) {
           g_gxState.tcgs[i + 4].mtx = static_cast<GXTexMtx>(bp_get(val, 6, i * 6));
         }
-        g_gxState.stateDirty = true;
+        mark_dirty_all();
         break;
       }
       case 0x1A:
@@ -1485,14 +1508,14 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
             proj.m1[2] = p3;
             proj.m3[2] = -1.0f;
           }
-          g_gxState.stateDirty = true;
+          mark_dirty_uniform();
         }
         break;
       }
       case 0x3F:
         // numTexGens
         g_gxState.numTexGens = val;
-        g_gxState.stateDirty = true;
+        mark_dirty_all();
         break;
       default:
         // TexGen config (0x40-0x4F) and post-transform (0x50-0x5F)
@@ -1523,14 +1546,14 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian) {
             if (srcRow < 13) {
               tcg.src = rowToSrc[srcRow];
             }
-            g_gxState.stateDirty = true;
+            mark_dirty_all();
           }
         } else if (reg >= 0x50 && reg <= 0x5F) {
           u32 tcIdx = reg - 0x50;
           if (tcIdx < MaxTexCoord) {
             g_gxState.tcgs[tcIdx].postMtx = static_cast<GXPTTexMtx>(bp_get(val, 6, 0) + 64);
             g_gxState.tcgs[tcIdx].normalize = bp_get(val, 1, 8) != 0;
-            g_gxState.stateDirty = true;
+            mark_dirty_all();
           }
         } else {
 #ifndef NDEBUG
@@ -2017,6 +2040,21 @@ static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs
 
 // Expand one GX vertex (FIFO record at `rec`) into hardware attributes.
 static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const u8* rec, ByteBuffer& out) {
+  // One expanded hardware vertex is at most pnmtxidx(4) + 8 texmtxidx(32) + pos(12) +
+  // nrm(12) + 2 colors(8) + 8 texcoords(64) = 132 bytes. Encoding into this stack
+  // record and appending once per vertex removes the per-component ByteBuffer
+  // bounds-check/memcpy pair that dominated the expansion profile (hundreds of
+  // thousands of 4-byte appends per frame in animated board/minigame scenes).
+  alignas(4) u8 vtx[160];
+  u32 cur = 0;
+  const auto put_f32 = [&](f32 v) {
+    std::memcpy(vtx + cur, &v, 4);
+    cur += 4;
+  };
+  const auto put_u32 = [&](u32 v) {
+    std::memcpy(vtx + cur, &v, 4);
+    cur += 4;
+  };
   for (const auto& d : descs) {
     const u8* p;
     if (d.attrType == GX_DIRECT) {
@@ -2035,28 +2073,29 @@ static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const
     const auto compType = static_cast<GXCompType>(d.compType);
     if (attr == GX_VA_PNMTXIDX) {
 #ifdef AURORA_GLES2
-      out.append<f32>(static_cast<f32>(u32(*p) / 3u));
+      put_f32(static_cast<f32>(u32(*p) / 3u));
 #else
-      out.append<u32>(u32(*p) / 3u); // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
+      put_u32(u32(*p) / 3u); // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
 #endif
     } else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
 #ifdef AURORA_GLES2
-      out.append<f32>(static_cast<f32>(u32(*p)));
+      put_f32(static_cast<f32>(u32(*p)));
 #else
-      out.append<u32>(u32(*p)); // raw; shader divides by 3
+      put_u32(u32(*p)); // raw; shader divides by 3
 #endif
     } else if (attr == GX_VA_POS || attr == GX_VA_NRM) {
       for (int c = 0; c < 3; ++c) {
-        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+        put_f32(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
       }
     } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
-      out.append<u32>(read_color_as_rgba8(p, compType, be));
+      put_u32(read_color_as_rgba8(p, compType, be));
     } else { // TEXn
       for (int c = 0; c < 2; ++c) {
-        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+        put_f32(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
       }
     }
   }
+  out.append(vtx, cur);
 }
 
 static ByteBuffer s_nativeVtxBuf;
@@ -2098,10 +2137,11 @@ static constexpr bool kStripTopology = true;
 // Emit a periodic one-line cache/batching summary to confirm the geometry cache is
 // actually hitting on-device (and how effective run-batching is). Perf-tuning scaffolding;
 // off by default in shipped builds.
-static constexpr bool kLogNativeGeomCacheStats = false;
+static constexpr bool kLogNativeGeomCacheStats = true;
 static constexpr u32 kNativeGeomStatsLogInterval = 300; // frames between summaries
 // Per-window counters (reset each log interval).
 static u64 s_geomCacheHits = 0;       // draws served from the persistent cache (no expand/upload)
+static u64 s_geomFrameCacheHits = 0;  // same-frame geometry reuse from the per-frame rings
 static u64 s_geomCacheMisses = 0;     // draws that had to expand this frame
 static u64 s_geomCachePromotes = 0;   // expansions promoted into the persistent cache
 static u64 s_geomCacheRingPushes = 0; // expansions that went to the per-frame ring
@@ -2129,8 +2169,19 @@ struct NativeGeomEntry {
   gfx::Range vertRange;
   gfx::Range idxRange;
   u32 indexCount = 0;
+  u32 cacheBank = 0;
+};
+struct NativeFrameGeomEntry {
+  gfx::Range vertRange;
+  gfx::Range idxRange;
+  u32 indexCount = 0;
 };
 static absl::flat_hash_map<NativeGeomKey, NativeGeomEntry, NativeGeomKeyHash> s_nativeGeomCache;
+// Exact geometry can recur within one frame (for example shadow/main rendering) even
+// when CPU deformation changes it every frame. Reuse the already-expanded per-frame
+// ring ranges instead of expanding and uploading the same bytes twice.
+static absl::flat_hash_map<NativeGeomKey, NativeFrameGeomEntry, NativeGeomKeyHash> s_nativeGeomFrameCache;
+static u32 s_nativeGeomFrameCacheFrame = UINT32_MAX;
 // Keys seen but not yet promoted, mapped to the frame they were last seen in. Content is
 // promoted to the persistent cache only once it recurs across frames, which keeps
 // single-shot and per-frame-animated geometry from ever entering the cache.
@@ -2149,13 +2200,15 @@ static void native_geom_cache_maybe_log_stats() {
   }
   const u32 frames = frame - s_geomStatsLastFrame;
   s_geomStatsLastFrame = frame;
-  const u64 draws = s_geomCacheHits + s_geomCacheMisses;
+  const u64 draws = s_geomCacheHits + s_geomFrameCacheHits + s_geomCacheMisses;
   Log.info(
-      "[geom-cache] {}f: {} draws, {}/{} hit ({:.1f}%), {} promote, {} ring, {} full; "
+      "[geom-cache] {}f: {} draws, {}/{} persistent ({:.1f}%), {} frame-reuse, "
+      "{} promote, {} ring, {} full; "
       "src {} run/{} indexed/{} sized, batched {}<-{} segs ({:.2f}/run); {} entries",
-      frames, draws, s_geomCacheHits, draws, draws != 0 ? 100.0 * static_cast<double>(s_geomCacheHits) / draws : 0.0,
-      s_geomCachePromotes, s_geomCacheRingPushes, s_geomCacheFull, s_geomRunsBatched, s_geomDrawsIndexed,
-      s_geomDrawsSingle, s_geomRunsBatched, s_geomSegmentsBatched,
+      frames, draws, s_geomCacheHits, draws,
+      draws != 0 ? 100.0 * static_cast<double>(s_geomCacheHits) / draws : 0.0, s_geomFrameCacheHits,
+      s_geomCachePromotes, s_geomCacheRingPushes, s_geomCacheFull, s_geomRunsBatched,
+      s_geomDrawsIndexed, s_geomDrawsSingle, s_geomRunsBatched, s_geomSegmentsBatched,
       s_geomRunsBatched != 0 ? static_cast<double>(s_geomSegmentsBatched) / s_geomRunsBatched : 0.0,
       s_nativeGeomCache.size());
   // Per-frame staging->GPU upload volume (last completed frame). This is what feeds the libmali
@@ -2170,6 +2223,7 @@ static void native_geom_cache_maybe_log_stats() {
            gfx::g_stats.lastUniformSize * kib, gfx::g_stats.lastTextureUploadSize * kib,
            gfx::g_stats.lastStorageSize * kib, static_cast<double>(uploadTotal) * kib);
   s_geomCacheHits = 0;
+  s_geomFrameCacheHits = 0;
   s_geomCacheMisses = 0;
   s_geomCachePromotes = 0;
   s_geomCacheRingPushes = 0;
@@ -2180,15 +2234,29 @@ static void native_geom_cache_maybe_log_stats() {
   s_geomDrawsSingle = 0;
 }
 
-// The persistent cache byte regions are recycled on reset (generation bump), which
-// invalidates every cached (key -> range) mapping. Drop both maps when that happens.
+// A generation bump means one of the two persistent cache banks is about to be reused.
+// Drop only mappings into that bank; entries in the other bank remain valid and hot.
 static void native_geom_sync_generation() {
   native_geom_cache_maybe_log_stats();
+  const u32 frame = gfx::current_frame();
+  if (frame != s_nativeGeomFrameCacheFrame) {
+    s_nativeGeomFrameCacheFrame = frame;
+    s_nativeGeomFrameCache.clear();
+  }
   const u32 gen = gfx::native_geom_cache_generation();
   if (gen != s_nativeGeomCacheGen) {
     s_nativeGeomCacheGen = gen;
-    s_nativeGeomCache.clear();
+    const u32 recycledBank = gfx::native_geom_cache_bank();
+    for (auto it = s_nativeGeomCache.begin(); it != s_nativeGeomCache.end();) {
+      if (it->second.cacheBank == recycledBank) {
+        auto stale = it++;
+        s_nativeGeomCache.erase(stale);
+      } else {
+        ++it;
+      }
+    }
     s_nativeGeomSeen.clear();
+    s_nativeGeomFrameCache.clear();
   }
 }
 
@@ -2239,6 +2307,50 @@ static void native_geom_hash_layout(Hasher& h, const std::vector<NativeAttrDesc>
   }
 }
 
+// Bumped whenever GX_AURORA_LOAD_ARRAYBASE actually changes an attribute array binding;
+// part of the layout-hash cache validity below.
+static u32 s_nativeArrayBindGen = 0;
+
+// Cached digest of native_geom_hash_layout. Consecutive draws in a scene almost always
+// share the exact same decode layout, but the per-draw streaming hash of ~10 descs was a
+// measurable slice of the FIFO drain. Validity is compare-based (memcmp of the descs the
+// digest was computed from) plus the array bind/invalidate generations and — only when the
+// layout references indexed arrays — the frame (array CONTENT hashes are memoized
+// per-frame upstream, mirroring native_array_content_hash's own validity rules).
+static std::vector<NativeAttrDesc> s_layoutHashDescs;
+static u64 s_layoutHashValue = 0;
+static u32 s_layoutHashArrayInvalGen = 0;
+static u32 s_layoutHashArrayBindGen = 0;
+static u32 s_layoutHashFrame = 0;
+static bool s_layoutHashValid = false;
+
+static u64 native_geom_layout_hash(const std::vector<NativeAttrDesc>& descs) {
+  bool hasIndexed = false;
+  for (const auto& d : descs) {
+    if (d.attrType == GX_INDEX8 || d.attrType == GX_INDEX16) {
+      hasIndexed = true;
+      break;
+    }
+  }
+  const u32 frame = gfx::current_frame();
+  if (s_layoutHashValid && (!hasIndexed || s_layoutHashFrame == frame) &&
+      s_layoutHashArrayInvalGen == s_gxArrayInvalidateGen && s_layoutHashArrayBindGen == s_nativeArrayBindGen &&
+      s_layoutHashDescs.size() == descs.size() &&
+      (descs.empty() ||
+       std::memcmp(s_layoutHashDescs.data(), descs.data(), descs.size() * sizeof(NativeAttrDesc)) == 0)) {
+    return s_layoutHashValue;
+  }
+  Hasher h;
+  native_geom_hash_layout(h, descs);
+  s_layoutHashValue = h.digest();
+  s_layoutHashDescs = descs;
+  s_layoutHashArrayInvalGen = s_gxArrayInvalidateGen;
+  s_layoutHashArrayBindGen = s_nativeArrayBindGen;
+  s_layoutHashFrame = frame;
+  s_layoutHashValid = true;
+  return s_layoutHashValue;
+}
+
 // Resolve the GPU ranges for a freshly expanded batch. On the first cross-frame recurrence
 // of identical content the batch is promoted into the persistent cache; otherwise it goes
 // to the per-frame ring. `cached` reports which buffers the returned ranges address.
@@ -2264,14 +2376,18 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
         vertRange = cv;
         idxRange = ci;
         cached = true;
-        s_nativeGeomCache.emplace(key, NativeGeomEntry{.vertRange = cv, .idxRange = ci, .indexCount = numIndices});
+        s_nativeGeomCache.emplace(key, NativeGeomEntry{.vertRange = cv,
+                                                       .idxRange = ci,
+                                                       .indexCount = numIndices,
+                                                       .cacheBank = gfx::native_geom_cache_bank()});
         s_nativeGeomSeen.erase(seenIt);
         if constexpr (kLogNativeGeomCacheStats) {
           ++s_geomCachePromotes;
         }
         return;
       }
-      // Cache exhausted — recycle it at the next frame boundary and use the ring now.
+      // Active bank exhausted — rotate to the other bank at the next frame boundary
+      // and use the per-frame ring now. The full bank remains readable and hot.
       if constexpr (kLogNativeGeomCacheStats) {
         ++s_geomCacheFull;
       }
@@ -2293,37 +2409,97 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
   }
 }
 
+// Cheap steady_clock accumulator for the [fps] drain split. Scoped so early returns
+// (cache-hit paths, merge path) still account their elapsed time.
+struct PerfstallScope {
+  std::atomic<uint64_t>& sink;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  explicit PerfstallScope(std::atomic<uint64_t>& s) : sink(s) {}
+  ~PerfstallScope() {
+    sink.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count(),
+        std::memory_order_relaxed);
+  }
+};
+
+// Memo for the per-draw pipeline work. Between two native draws whose only GX
+// changes were uniform-value writes (matrices, lights, register colors — the
+// mark_dirty_uniform sites), the pipeline config, shader info, pipeline ref and
+// bind groups are provably identical, so the populate/build/hash chain is skipped.
+// texStateDirty alone re-resolves textures/bind groups but keeps config/info/
+// pipeline (they do not depend on bound textures). Invalidated at every process()
+// entry so no ref is ever reused across frames (bind-group cache entries expire
+// between frames).
+struct NativeDrawMemo {
+  bool valid = false;
+  GXPrimitive prim{};
+  GXVtxFmt fmt{};
+  u8 nativeStride = 0;
+  bool stripTopology = false;
+  std::array<AttrConfig, MaxVtxAttr> attrs{};
+  ShaderInfo info{};
+  GXBindGroups bindGroups{};
+  gfx::PipelineRef pipeline{};
+};
+static NativeDrawMemo s_nativeDrawMemo;
+
+static void invalidate_native_draw_memo() { s_nativeDrawMemo.valid = false; }
+
 static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                 const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
                                 gfx::Range vertRange, gfx::Range idxRange, u32 numIndices, bool cachedGeometry = false,
                                 bool stripTopology = false) {
+  PerfstallScope perfCfg{gfx::perfstall::drawCfgNs};
   const bool stateUnchanged = !g_gxState.stateDirty;
-  PipelineConfig config{};
-  populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
-  // The storage shader expands GX lines/points into instanced screen-space quads.
-  // ES2 has no usable instancing path on this Mali, so submit the original vertices
-  // through fixed-function line/point rasterization instead. This preserves the
-  // geometry and TEV result (at the implementation's supported raster width) rather
-  // than dropping the draw entirely.
-  if (prim == GX_LINES) {
-    config.shaderConfig.lineMode = 0;
-    config.nativeRasterTopology = 1;
-  } else if (prim == GX_LINESTRIP) {
-    config.shaderConfig.lineMode = 0;
-    config.nativeRasterTopology = 2;
-  } else if (prim == GX_POINTS) {
-    config.shaderConfig.lineMode = 0;
-    config.nativeRasterTopology = 3;
-  }
-  config.shaderConfig.attrs = nativeAttrs;
-  config.shaderConfig.vtxStride = nativeStride;
-  config.shaderConfig.nativeVertexFetch = 1;
-  config.triangleStripTopology = stripTopology ? 1u : 0u;
+  auto& memo = s_nativeDrawMemo;
+  const bool memoMatches = memo.valid && !g_gxState.pipelineStateDirty && memo.prim == prim && memo.fmt == fmt &&
+                           memo.nativeStride == nativeStride && memo.stripTopology == stripTopology &&
+                           std::memcmp(memo.attrs.data(), nativeAttrs.data(), sizeof(nativeAttrs)) == 0;
+  if (memoMatches) {
+    if (g_gxState.texStateDirty) {
+      resolve_sampled_textures(memo.info);
+      memo.bindGroups = build_bind_groups(memo.info);
+      g_gxState.texStateDirty = false;
+    }
+  } else {
+    PipelineConfig config{};
+    populate_pipeline_config(config, prim, fmt); // TEV/color/blend/etc; also fills storage attrs (overwritten below)
+    // The storage shader expands GX lines/points into instanced screen-space quads.
+    // ES2 has no usable instancing path on this Mali, so submit the original vertices
+    // through fixed-function line/point rasterization instead. This preserves the
+    // geometry and TEV result (at the implementation's supported raster width) rather
+    // than dropping the draw entirely.
+    if (prim == GX_LINES) {
+      config.shaderConfig.lineMode = 0;
+      config.nativeRasterTopology = 1;
+    } else if (prim == GX_LINESTRIP) {
+      config.shaderConfig.lineMode = 0;
+      config.nativeRasterTopology = 2;
+    } else if (prim == GX_POINTS) {
+      config.shaderConfig.lineMode = 0;
+      config.nativeRasterTopology = 3;
+    }
+    config.shaderConfig.attrs = nativeAttrs;
+    config.shaderConfig.vtxStride = nativeStride;
+    config.shaderConfig.nativeVertexFetch = 1;
+    config.triangleStripTopology = stripTopology ? 1u : 0u;
 
-  const auto info = build_shader_info(config.shaderConfig);
-  resolve_sampled_textures(info);
-  const auto bindGroups = build_bind_groups(info);
-  const auto pipeline = gfx::pipeline_ref(config);
+    memo.info = build_shader_info(config.shaderConfig);
+    resolve_sampled_textures(memo.info);
+    memo.bindGroups = build_bind_groups(memo.info);
+    memo.pipeline = gfx::pipeline_ref(config);
+    memo.valid = true;
+    memo.prim = prim;
+    memo.fmt = fmt;
+    memo.nativeStride = nativeStride;
+    memo.stripTopology = stripTopology;
+    memo.attrs = nativeAttrs;
+    g_gxState.pipelineStateDirty = false;
+    g_gxState.texStateDirty = false;
+  }
+  const auto& info = memo.info;
+  const auto bindGroups = memo.bindGroups;
+  const auto pipeline = memo.pipeline;
 
   // A triangle list with unchanged GX state can share the previous native draw when
   // both pieces are adjacent in the same backing buffer. This is the native-fetch
@@ -2345,14 +2521,19 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   }
 
   BindGroupRanges ranges{}; // native resolves indexed attrs on the CPU — no array uploads
+  gfx::Range uniformRange;
+  {
+    PerfstallScope perfUni{gfx::perfstall::drawUniNs};
+    // Native shaders read real vertex attributes, so the storage-ring byte offset
+    // in u_data[0].x is dead. Keeping it zero avoids a needless uniform change for
+    // otherwise-identical draws that reference different geometry.
+    uniformRange = build_uniform(info, 0, ranges);
+  }
   gfx::push_draw_command(DrawData{
       .pipeline = pipeline,
       .vertRange = vertRange,
       .idxRange = idxRange,
-      // Native shaders read real vertex attributes, so the storage-ring byte offset
-      // in u_data[0].x is dead. Keeping it zero avoids a needless uniform change for
-      // otherwise-identical draws that reference different geometry.
-      .uniformRange = build_uniform(info, 0, ranges),
+      .uniformRange = uniformRange,
       .vtxCount = vtxCount,
       .indexCount = numIndices,
       .instanceCount = 1,
@@ -2403,6 +2584,15 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
                           it->second.indexCount, /*cachedGeometry=*/true);
       return true;
     }
+    if (const auto it = s_nativeGeomFrameCache.find(key); it != s_nativeGeomFrameCache.end()) {
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomFrameCacheHits;
+      }
+      pos += srcBytes;
+      push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange, it->second.idxRange,
+                          it->second.indexCount, /*cachedGeometry=*/false);
+      return true;
+    }
     if constexpr (kLogNativeGeomCacheStats) {
       ++s_geomCacheMisses;
     }
@@ -2430,6 +2620,10 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   bool cached = false;
   native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
                              indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+  if (!cached) {
+    s_nativeGeomFrameCache.insert_or_assign(
+        key, NativeFrameGeomEntry{.vertRange = vertRange, .idxRange = idxRange, .indexCount = numIndices});
+  }
   s_nativeIdxBuf.clear();
 
   push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices, cached);
@@ -2497,20 +2691,37 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
   // structure (+ indexed array contents). A hit replays cached GPU ranges with no CPU work.
   NativeGeomKey key{};
   if constexpr (kNativeGeomCacheEnabled) {
-    Hasher fifo;
-    for (size_t s = 0; s < segCounts.size(); ++s) {
-      fifo.update(data + segOffsets[s], static_cast<size_t>(segCounts[s]) * vtxSize);
+    std::optional<PerfstallScope> perfHash{std::in_place, gfx::perfstall::geomHashNs};
+    // One-shot hashing: the streaming Hasher pays a full state reset per draw, which at
+    // ~1500 draws/frame was a measurable slice of the drain. Runs are single-segment in
+    // practice (batched 1.00/run in board/minigame scenes), so the FIFO bytes hash in one
+    // XXH3 call; the fixed meta fields chain off the cached layout digest as the seed.
+    u64 fifoHash;
+    if (segCounts.size() == 1) {
+      fifoHash = xxh3_hash_s(data + segOffsets[0], static_cast<size_t>(segCounts[0]) * vtxSize);
+    } else {
+      Hasher fifo;
+      for (size_t s = 0; s < segCounts.size(); ++s) {
+        fifo.update(data + segOffsets[s], static_cast<size_t>(segCounts[s]) * vtxSize);
+      }
+      fifoHash = fifo.digest();
     }
-    Hasher meta;
-    meta.update(static_cast<u8>(prim));
-    meta.update(static_cast<u8>(fmt));
-    meta.update(vtxSize);
-    meta.update(batchVtxCount);
-    meta.update(segCounts.data(), segCounts.size() * sizeof(u16));
-    native_geom_hash_layout(meta, s_nativeDescs);
-    key = {fifo.digest(), meta.digest(), srcBytes};
+    struct NativeRunMeta {
+      u8 prim;
+      u8 fmt;
+      u16 pad = 0;
+      u32 vtxSize;
+      u32 batchVtxCount;
+    };
+    static_assert(std::has_unique_object_representations_v<NativeRunMeta>);
+    const NativeRunMeta metaFixed{static_cast<u8>(prim), static_cast<u8>(fmt), 0, vtxSize, batchVtxCount};
+    u64 metaHash =
+        xxh3_hash_s(&metaFixed, sizeof(metaFixed), static_cast<HashType>(native_geom_layout_hash(s_nativeDescs)));
+    metaHash = xxh3_hash_s(segCounts.data(), segCounts.size() * sizeof(u16), static_cast<HashType>(metaHash));
+    key = {fifoHash, metaHash, srcBytes};
     native_geom_sync_generation();
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
+      perfHash.reset();
       if constexpr (kLogNativeGeomCacheStats) {
         ++s_geomCacheHits;
       }
@@ -2519,46 +2730,63 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
                           it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true, stripTopology);
       return true;
     }
+    if (const auto it = s_nativeGeomFrameCache.find(key); it != s_nativeGeomFrameCache.end()) {
+      perfHash.reset();
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomFrameCacheHits;
+      }
+      pos = scan;
+      push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, it->second.vertRange,
+                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/false, stripTopology);
+      return true;
+    }
     if constexpr (kLogNativeGeomCacheStats) {
       ++s_geomCacheMisses;
     }
   }
 
-  // Miss — expand every segment into flat native attributes (contiguous in one buffer).
-  s_nativeVtxBuf.clear();
-  s_nativeVtxBuf.reserve_extra(batchVtxCount * nativeStride);
-  for (size_t s = 0; s < segCounts.size(); ++s) {
-    const u8* segData = data + segOffsets[s];
-    for (u16 v = 0; v < segCounts[s]; ++v) {
-      expand_native_vertex(s_nativeDescs, segData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
-    }
-  }
-  pos = scan;
-
-  // Index topology for the run: strips stay strips (restart-separated); a plain triangle
-  // list draws non-indexed; fans/quads (and strips when strip topology is off) unroll to a
-  // per-segment triangle list.
-  s_nativeIdxBuf.clear();
-  u32 numIndices = 0;
-  bool indexed = true;
-  if (stripTopology) {
-    numIndices = build_triangle_strip_batch_topology_indices(s_nativeIdxBuf, segCounts);
-  } else if (prim == GX_TRIANGLES) {
-    indexed = false; // numIndices stays 0 -> non-indexed Draw(batchVtxCount)
-  } else {
-    u16 segStart = 0;
-    for (const u16 count : segCounts) {
-      numIndices += prepare_idx_buffer(s_nativeIdxBuf, prim, segStart, count);
-      segStart = static_cast<u16>(segStart + count);
-    }
-  }
-
   gfx::Range vertRange{};
   gfx::Range idxRange{};
+  u32 numIndices = 0;
   bool cached = false;
-  native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
-                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
-  s_nativeIdxBuf.clear();
+  {
+    PerfstallScope perfExpand{gfx::perfstall::geomExpandNs};
+    // Miss — expand every segment into flat native attributes (contiguous in one buffer).
+    s_nativeVtxBuf.clear();
+    s_nativeVtxBuf.reserve_extra(batchVtxCount * nativeStride);
+    for (size_t s = 0; s < segCounts.size(); ++s) {
+      const u8* segData = data + segOffsets[s];
+      for (u16 v = 0; v < segCounts[s]; ++v) {
+        expand_native_vertex(s_nativeDescs, segData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+      }
+    }
+    pos = scan;
+
+    // Index topology for the run: strips stay strips (restart-separated); a plain triangle
+    // list draws non-indexed; fans/quads (and strips when strip topology is off) unroll to a
+    // per-segment triangle list.
+    s_nativeIdxBuf.clear();
+    bool indexed = true;
+    if (stripTopology) {
+      numIndices = build_triangle_strip_batch_topology_indices(s_nativeIdxBuf, segCounts);
+    } else if (prim == GX_TRIANGLES) {
+      indexed = false; // numIndices stays 0 -> non-indexed Draw(batchVtxCount)
+    } else {
+      u16 segStart = 0;
+      for (const u16 count : segCounts) {
+        numIndices += prepare_idx_buffer(s_nativeIdxBuf, prim, segStart, count);
+        segStart = static_cast<u16>(segStart + count);
+      }
+    }
+
+    native_geom_resolve_ranges(key, s_nativeVtxBuf, indexed ? s_nativeIdxBuf.data() : nullptr,
+                               indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+    if (!cached) {
+      s_nativeGeomFrameCache.insert_or_assign(
+          key, NativeFrameGeomEntry{.vertRange = vertRange, .idxRange = idxRange, .indexCount = numIndices});
+    }
+    s_nativeIdxBuf.clear();
+  }
 
   push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, vertRange, idxRange,
                       numIndices, cached, stripTopology);
@@ -2599,6 +2827,14 @@ static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u
                           it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true);
       return true;
     }
+    if (const auto it = s_nativeGeomFrameCache.find(key); it != s_nativeGeomFrameCache.end()) {
+      if constexpr (kLogNativeGeomCacheStats) {
+        ++s_geomFrameCacheHits;
+      }
+      push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange,
+                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/false);
+      return true;
+    }
     if constexpr (kLogNativeGeomCacheStats) {
       ++s_geomCacheMisses;
     }
@@ -2614,6 +2850,10 @@ static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u
   gfx::Range idxRange{};
   bool cached = false;
   native_geom_resolve_ranges(key, s_nativeVtxBuf, idxData, idxBytes, indexCount, vertRange, idxRange, cached);
+  if (!cached) {
+    s_nativeGeomFrameCache.insert_or_assign(
+        key, NativeFrameGeomEntry{.vertRange = vertRange, .idxRange = idxRange, .indexCount = indexCount});
+  }
 
   push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, indexCount, cached);
   return true;
@@ -2689,7 +2929,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
         pos += 4;
       }
     }
-    g_gxState.stateDirty = true;
+    mark_dirty_uniform();
   } else if (subCmd >= GX_AURORA_LOAD_ARRAYBASE && subCmd <= (GX_AURORA_LOAD_ARRAYBASE | 0x0f)) {
     CHECK(pos + 13 <= size, "GX_AURORA_LOAD_ARRAYBASE read overrun");
     u32 attrIdx = subCmd - GX_AURORA_LOAD_ARRAYBASE + GX_VA_POS;
@@ -2709,7 +2949,8 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       array.le = le;
       // Only drop the cached upload when the backing array actually changes.
       array.cachedRange = {};
-      g_gxState.stateDirty = true;
+      ++s_nativeArrayBindGen; // layout-hash cache keys indexed-array content by binding
+      mark_dirty_all();
     }
   } else if (subCmd == GX_AURORA_LOAD_TEXOBJ) {
     CHECK(pos + 34 <= size, "GX_AURORA_LOAD_TEXOBJ read overrun");
@@ -2738,7 +2979,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     slot.texDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
     slot.set_no_cache(false); // Reset no-cache flag
-    g_gxState.stateDirty = true;
+    mark_dirty_tex();
   } else if (subCmd == GX_AURORA_LOAD_TLUT) {
     CHECK(pos + 23 <= size, "GX_AURORA_LOAD_TLUT read overrun");
     const auto idx = data[pos];
@@ -2756,7 +2997,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     slot.tlutDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
     slot.set_no_cache(false); // Reset no-cache flag
-    g_gxState.stateDirty = true;
+    mark_dirty_tex();
   } else if (subCmd == GX2_SET_POLYGON_OFFSET) {
     CHECK(pos + 20 <= size, "GX2_SET_POLYGON_OFFSET read overrun");
     g_gxState.frontOffset = read_f32(data + pos, bigEndian);
@@ -2769,7 +3010,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
     g_gxState.clamp = read_f32(data + pos, bigEndian);
     pos += 4;
-    g_gxState.stateDirty = true;
+    mark_dirty_all();
   } else if (subCmd == GX_AURORA_LOAD_COPY_SRC) {
     CHECK(pos + 16 <= size, "GX_AURORA_LOAD_COPY_SRC read overrun");
     const int32_t left = static_cast<int32_t>(read_u32(data + pos, bigEndian));
