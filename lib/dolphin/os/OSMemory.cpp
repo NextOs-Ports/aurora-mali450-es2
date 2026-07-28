@@ -7,6 +7,11 @@
 #include "fmt/base.h"
 
 #include <cassert>
+#include <cstdlib>
+
+#if defined(__unix__)
+#include <sys/mman.h>
+#endif
 
 #include "internal.hpp"
 #include <dolphin/os.h>
@@ -135,6 +140,34 @@ static void* AllocMEM1(u32 size) {
 
   assert(result == mem1Address);
   return result;
+}
+#elif defined(__unix__) && (INTPTR_MAX > INT32_MAX)
+static void* AllocMEM1(u32 size) {
+  // Place MEM1 inside the low 4 GiB.
+  //
+  // GameCube game code stores addresses in u32 all over the place - heap
+  // bookkeeping, ARAM DMA descriptors, texture cache entries.  Every one of
+  // those truncates a 64-bit pointer.  Keeping the whole region addressable in
+  // 32 bits makes the truncation lossless instead of hunting down each site,
+  // and it costs nothing: this is a fixed-size allocation made once at startup.
+  constexpr uintptr_t kLowBase = 0x20000000;
+  constexpr uintptr_t kLowLimit = 0x00000000FFFFFFFFull;
+
+  for (uintptr_t hint = kLowBase; hint + size <= kLowLimit; hint += 0x10000000) {
+    void* result = mmap(reinterpret_cast<void*>(hint), size, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (result == MAP_FAILED) {
+      continue;
+    }
+    if (reinterpret_cast<uintptr_t>(result) + size <= kLowLimit) {
+      Log.info("MEM1 mapped at {:#010x} ({} MiB)", reinterpret_cast<uintptr_t>(result), size / (1024 * 1024));
+      return result;
+    }
+    munmap(result, size);
+  }
+
+  Log.warn("Could not place MEM1 below 4 GiB; 32-bit address truncation in game code will misbehave");
+  return calloc(1, size);
 }
 #else
 static void* AllocMEM1(u32 size) {
