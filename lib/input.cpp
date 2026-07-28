@@ -394,6 +394,12 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
     Log.info("Added controller '{}' (instance {}, vid {:04x}, pid {:04x}, type {})",
              SDL_GetGamepadName(ctrl) != nullptr ? SDL_GetGamepadName(ctrl) : "unknown", instance, controller.m_vid,
              controller.m_pid, static_cast<int>(SDL_GetGamepadType(ctrl)));
+    if (char* mapping = SDL_GetGamepadMapping(ctrl); mapping != nullptr) {
+      Log.info("Effective controller mapping: {}", mapping);
+      SDL_free(mapping);
+    } else {
+      Log.warn("No effective controller mapping for instance {}: {}", instance, SDL_GetError());
+    }
     g_GameControllers[instance] = controller;
     apply_port_preferences();
     if (SDL_GetGamepadPlayerIndex(ctrl) < 0) {
