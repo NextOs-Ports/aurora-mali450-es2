@@ -2022,7 +2022,11 @@ static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs
       srcOffset += isMtxIdx ? 1 : static_cast<u8>(comp_type_size(attr, attrFmt.type) * cnt);
     } else if (type == GX_INDEX8 || type == GX_INDEX16) {
       const auto& array = g_gxState.arrays[i];
-      if (array.data == nullptr || array.size == 0 || array.stride == 0) {
+      // GX itself receives only a pointer and stride. Some Pikmin cinematic
+      // models likewise bind a valid normal array with no byte extent; that is
+      // not a missing array and must remain drawable. Unsized arrays are kept
+      // out of the cross-frame content cache below.
+      if (array.data == nullptr || array.stride == 0) {
         return native_decline(2, fmt, i);
       }
       d.le = array.le;
@@ -2078,9 +2082,11 @@ static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const
     } else {
       u32 index = d.attrType == GX_INDEX8 ? u32(*(rec + d.srcOffset)) : u32(read_u16(rec + d.srcOffset, true));
       const auto& array = g_gxState.arrays[d.attr];
-      const u32 maxIndex = d.arrayStride != 0 ? static_cast<u32>(array.size) / d.arrayStride : 0u;
-      if (index >= maxIndex) {
-        index = 0; // guard against malformed indices; valid content never hits this
+      if (array.size != 0) {
+        const u32 maxIndex = static_cast<u32>(array.size) / d.arrayStride;
+        if (index >= maxIndex) {
+          index = 0; // guard against malformed indices; valid content never hits this
+        }
       }
       p = static_cast<const u8*>(array.data) + static_cast<size_t>(index) * d.arrayStride;
     }
@@ -2318,7 +2324,17 @@ static void native_geom_hash_layout(Hasher& h, const std::vector<NativeAttrDesc>
     h.update(d.arrayStride);
     h.update(static_cast<u8>(d.le ? 1 : 0));
     if (d.attrType == GX_INDEX8 || d.attrType == GX_INDEX16) {
-      h.update(native_array_content_hash(g_gxState.arrays[d.attr]));
+      const auto& array = g_gxState.arrays[d.attr];
+      if (array.size != 0) {
+        h.update(native_array_content_hash(array));
+      } else {
+        // With no declared extent there is nothing safe to content-hash.
+        // Pointer identity plus the frame keeps same-frame reuse available,
+        // while making cross-frame promotion (and stale animated normals)
+        // impossible.
+        h.update(reinterpret_cast<uintptr_t>(array.data));
+        h.update(gfx::current_frame());
+      }
     }
   }
 }
