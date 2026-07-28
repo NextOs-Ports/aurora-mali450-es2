@@ -116,6 +116,13 @@ typedef struct {
    * This can be set to 0 to disable allocating this region.
    */
   uint32_t mem2Size;
+
+  /*
+   * Present the finished frame stretched to the full surface instead of
+   * aspect-fit letterboxed. Meant for games that render anamorphic content
+   * (wider projection into the same EFB) so the stretch restores proportions.
+   */
+  bool presentStretch;
 } AuroraConfig;
 
 typedef struct {

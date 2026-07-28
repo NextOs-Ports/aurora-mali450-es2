@@ -377,6 +377,16 @@ Viewport calculate_present_viewport(uint32_t surface_width, uint32_t surface_hei
   if (surface_width == 0 || surface_height == 0 || content_width == 0 || content_height == 0) {
     return {};
   }
+  if (aurora::g_config.presentStretch) {
+    // Anamorphic present: the game renders a wider projection into the same EFB
+    // and the full-surface stretch restores the proportions. No letterbox.
+    return {
+        .left = 0.f,
+        .top = 0.f,
+        .width = static_cast<float>(surface_width),
+        .height = static_cast<float>(surface_height),
+    };
+  }
   uint32_t viewport_width = surface_width;
   uint32_t viewport_height = std::min<uint32_t>(
       surface_height, std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(static_cast<double>(viewport_width) *
