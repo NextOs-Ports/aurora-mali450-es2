@@ -23,7 +23,7 @@ struct DrawData {
   bool cachedGeometry = false;
 };
 
-constexpr uint32_t GXPipelineConfigVersion = 16;
+constexpr uint32_t GXPipelineConfigVersion = 17;
 struct PipelineConfig {
   uint32_t version = GXPipelineConfigVersion;
   uint32_t msaaSamples = 1;

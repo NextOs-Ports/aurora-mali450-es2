@@ -756,6 +756,16 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
           .matSrc = cc.matSrc,
       };
     }
+#ifdef AURORA_GLES2
+    // DF_NONE + AF_NONE is precomputed on the CPU and therefore stays
+    // mask-independent at the shader level.  Every other lit channel is
+    // specialized in lighting_func() so the classic Mali compiler sees only
+    // the lights the GX draw actually enables.
+    if (cc.lightingEnabled && (cc.diffFn != GX_DF_NONE || cc.attnFn != GX_AF_NONE)) {
+      config.shaderConfig.colorChannels[i].lightMask =
+          static_cast<u8>(g_gxState.colorChannelState[i].lightMask.to_ulong());
+    }
+#endif
   }
   for (u8 i = 0; i < g_gxState.numTexGens; ++i) {
     config.shaderConfig.tcgs[i] = g_gxState.tcgs[i];

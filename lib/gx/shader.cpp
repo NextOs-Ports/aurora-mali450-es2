@@ -892,16 +892,19 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
   }
 #ifdef AURORA_GLES2
   std::string lightSteps;
-  const auto maskName = fmt::format("ubuf.lightState{}{}", i, alpha ? "a"sv : ""sv);
+  const u8 lightMask = cc.lightMask;
   for (u32 li = 0; li < GX::MaxLights; ++li) {
+    if ((lightMask & (1u << li)) == 0) {
+      continue;
+    }
     lightSteps += fmt::format(R"""(
-      if (mod(floor({0} / {1}.0), 2.0) >= 1.0) {{
-          Light light = raw_light{2}();{3}
-          float attn;{4}
-          float diff = {5};
+      {{
+          Light light = raw_light{0}();{1}
+          float attn;{2}
+          float diff = {3};
           lighting = lighting + (attn * diff * light.color);
       }})""",
-                              maskName, 1u << li, li, lightVectorSetup, lightAttnFn, lightDiffFn);
+                              li, lightVectorSetup, lightAttnFn, lightDiffFn);
   }
   return fmt::format(R"""(
     {{
@@ -1827,6 +1830,11 @@ uint32_t build_shader(const ShaderConfig& config) noexcept {
   const auto label = fmt::format("GX shader {:x}", hash);
   const auto gl_program = gl::compile_program(program.vertex.c_str(), program.fragment.c_str(), label.c_str());
   if (gl_program == 0) {
+#ifdef AURORA_GLES2
+    Log.error("GX shader {:x} failed with specialized light masks {:02x}/{:02x}/{:02x}/{:02x}", hash,
+              config.colorChannels[0].lightMask, config.colorChannels[1].lightMask,
+              config.colorChannels[2].lightMask, config.colorChannels[3].lightMask);
+#endif
     return 0;
   }
   gl::configure_gx_program(gl_program, info.uniformSize);

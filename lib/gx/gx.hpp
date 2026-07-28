@@ -138,7 +138,10 @@ struct ColorChannelConfig {
   GXDiffuseFn diffFn = GX_DF_NONE;
   GXAttnFn attnFn = GX_AF_NONE;
   bool lightingEnabled = false;
-  u8 _p1 = 0;
+  // GLES2 specializes non-trivial lighting to this draw's enabled lights.
+  // This occupies the former padding byte, keeping ShaderConfig's layout size
+  // unchanged while making the mask part of its equality/hash.
+  u8 lightMask = 0;
   u8 _p2 = 0;
   u8 _p3 = 0;
 
