@@ -24,6 +24,30 @@ CardGciFolder::GciFile* CardGciFolder::getFile(uint32_t idx) {
   return nullptr;
 }
 
+// Directory-entry lookup. The SDK's file-number operations - CARDGetStatus,
+// CARDSetStatus, CARDFastDelete - address a directory entry, not an open
+// handle, and games call them on files they have already closed. Requiring
+// `opened` there makes every one of them fail.
+CardGciFolder::GciFile* CardGciFolder::getEntry(uint32_t idx) {
+  if (m_files.size() <= idx || m_files[idx].deleted) {
+    return nullptr;
+  }
+  return &m_files[idx];
+}
+
+const CardGciFolder::GciFile* CardGciFolder::getEntry(uint32_t idx) const {
+  if (m_files.size() <= idx || m_files[idx].deleted) {
+    return nullptr;
+  }
+  return &m_files[idx];
+}
+
+// A GCI file on disk is named "<maker>-<game>-<card filename>.gci".
+std::u8string CardGciFolder::gciFileName(const char* filename) const {
+  const std::string name = fmt::format("{}-{}-{}.gci", m_maker, m_game, filename);
+  return {reinterpret_cast<const char8_t*>(name.c_str())};
+}
+
 CardGciFolder::GciFile* CardGciFolder::getFile(FileHandle& fh) { return getFile(fh.getFileNo()); }
 
 const CardGciFolder::GciFile* CardGciFolder::getFile(uint32_t idx) const {
@@ -123,7 +147,10 @@ ECardResult CardGciFolder::createFile(const char* filename, size_t size, FileHan
   }
 
   gciFileHeader->swapEndian();
-  m_files.push_back({*gciFileHeader, fileSize, reinterpret_cast<const char8_t*>(gciFilename.c_str()), false}); // push non-endian swapped header first
+  // CARDCreate hands back an *open* handle - the caller writes through it and
+  // then calls CARDClose. Pushing this as closed makes getFile() refuse the
+  // handle we just returned, so the first write fails with NOCARD.
+  m_files.push_back({*gciFileHeader, fileSize, reinterpret_cast<const char8_t*>(gciFilename.c_str()), true}); // push non-endian swapped header first
   handleOut = FileHandle(m_files.size() - 1, 0);
 
   return ECardResult::READY;
@@ -149,16 +176,64 @@ void CardGciFolder::deleteFile(const FileHandle& fh) {
     fileIO.deleteFile();
 }
 
-ECardResult CardGciFolder::deleteFile(const char* filename) { return ECardResult::NOCARD; }
+ECardResult CardGciFolder::deleteFile(const char* filename) {
+  for (uint32_t idx = 0; idx < m_files.size(); idx++) {
+    if (!m_files[idx].deleted && strcmp(filename, m_files[idx].file.m_filename) == 0) {
+      return deleteFile(idx);
+    }
+  }
 
-ECardResult CardGciFolder::deleteFile(uint32_t fileno) { return ECardResult::NOCARD; }
+  return ECardResult::NOFILE;
+}
+
+// Deleting frees the entry's blocks and removes the file from disk. The slot
+// itself is kept, because file numbers are indices into this list and the game
+// holds on to them across operations.
+ECardResult CardGciFolder::deleteFile(uint32_t fileno) {
+  auto* gciFile = getEntry(fileno);
+  if (gciFile == nullptr) {
+    return ECardResult::NOFILE;
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(m_folderPath / gciFile->filename, ec);
+  if (ec) {
+    Log.warn("Failed to delete GCI file '{}': {}", fs_path_to_string(m_folderPath / gciFile->filename), ec.message());
+    return ECardResult::IOERROR;
+  }
+
+  m_bat.clear(gciFile->file.m_firstBlock, gciFile->file.m_blockCount);
+  gciFile->opened = false;
+  gciFile->deleted = true;
+  return ECardResult::READY;
+}
 
 ECardResult CardGciFolder::renameFile(const char* oldName, const char* newName) {
   for (auto& gciFile : m_files) {
-    if (strcmp(oldName, gciFile.file.m_filename) == 0) {
-      strncpy(gciFile.file.m_filename, newName, std::size(gciFile.file.m_filename));
-      return ECardResult::READY;
+    if (gciFile.deleted || strcmp(oldName, gciFile.file.m_filename) != 0) {
+      continue;
     }
+
+    // The name is part of the file's path on disk, so a rename has to move it -
+    // otherwise the save is written under the temporary name and never found
+    // again. Games save by writing "~name" and renaming it over "name".
+    const std::u8string newFileName = gciFileName(newName);
+    std::error_code ec;
+    std::filesystem::rename(m_folderPath / gciFile.filename, m_folderPath / newFileName, ec);
+    if (ec) {
+      Log.warn("Failed to rename GCI file '{}' to '{}': {}", fs_path_to_string(m_folderPath / gciFile.filename),
+               fs_path_to_string(m_folderPath / newFileName), ec.message());
+      return ECardResult::IOERROR;
+    }
+
+    gciFile.filename = newFileName;
+    strncpy(gciFile.file.m_filename, newName, std::size(gciFile.file.m_filename));
+
+    File tempFile = gciFile.file;
+    tempFile.swapEndian();
+    FileIO file(m_folderPath / gciFile.filename);
+    file.fileWrite(&tempFile, sizeof(File), 0);
+    return ECardResult::READY;
   }
 
   return ECardResult::NOCARD;
@@ -216,7 +291,7 @@ ECardResult CardGciFolder::getStatus(const FileHandle& fh, CardStat& statOut) co
 }
 
 ECardResult CardGciFolder::getStatus(uint32_t fileNo, CardStat& statOut) const {
-  auto gciFile = getFile(fileNo);
+  auto gciFile = getEntry(fileNo);
 
   if (!gciFile)
     return ECardResult::NOFILE;
@@ -271,7 +346,7 @@ ECardResult CardGciFolder::setStatus(const FileHandle& fh, const CardStat& stat)
 }
 
 ECardResult CardGciFolder::setStatus(uint32_t fileNo, const CardStat& stat) {
-  auto gciFile = getFile(fileNo);
+  auto gciFile = getEntry(fileNo);
 
   if (!gciFile)
     return ECardResult::NOFILE;
@@ -341,7 +416,7 @@ void CardGciFolder::format(ECardSlot deviceId, ECardSize size, EEncoding encodin
 
 void CardGciFolder::commit() {
   for (auto& gciFile : m_files) {
-    if (gciFile.opened) {
+    if (!gciFile.deleted) {
       FileIO file(m_folderPath / gciFile.filename);
 
       File tempFile = gciFile.file;

@@ -16,7 +16,10 @@ private:
     size_t fileSize;
     std::u8string filename;
     bool opened = false;
+    bool deleted = false;
   };
+
+  std::u8string gciFileName(const char* filename) const;
 
   std::vector<GciFile> m_files;
   std::filesystem::path m_folderPath;
@@ -31,6 +34,8 @@ private:
   const GciFile* getFile(FileHandle& fh) const;
   GciFile* getFile(uint32_t idx);
   const GciFile* getFile(uint32_t idx) const;
+  GciFile* getEntry(uint32_t idx);
+  const GciFile* getEntry(uint32_t idx) const;
 public:
   CardGciFolder();
   ~CardGciFolder() override = default;

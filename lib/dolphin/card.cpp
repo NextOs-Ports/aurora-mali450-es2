@@ -667,8 +667,15 @@ s32 CARDUnmount(const s32 chan) {
   if (chan < 0 || chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
-  // TODO:
-  return CARD_RESULT_NOCARD;
+  // CARDMount above reports READY; reporting NOCARD here made the pair
+  // asymmetric, and a game that unmounts after saving reads that back as "the
+  // save failed". There is nothing to unmount for a GCI folder, so flush any
+  // pending directory-entry changes and say so.
+  if (!CARD_READY(chan)) {
+    return CARD_RESULT_NOCARD;
+  }
+  GET_CARD(chan)->commit();
+  return CARD_RESULT_READY;
 }
 
 s32 CARDGetCurrentMode(const s32 chan, u32* mode [[maybe_unused]]) {
