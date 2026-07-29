@@ -144,6 +144,15 @@ void register_uniform_binding(GLuint program, uint32_t binding, const char* unif
   classic.location = gl.GetUniformLocation(program, uniformName);
   classic.maxBytes = maxBytes;
   classic.lastData.clear();
+  if (std::strcmp(uniformName, "u_data") == 0) {
+    const GLint indexedBase = gl.GetUniformLocation(program, "u_data[0]");
+    const GLint indexedFive = gl.GetUniformLocation(program, "u_data[5]");
+    if (classic.location < 0 || indexedBase != classic.location ||
+        (indexedFive >= 0 && indexedFive != indexedBase + 5)) {
+      Log.warn("GX classic uniform locations program {}: u_data={} [0]={} [5]={}", program, classic.location,
+               indexedBase, indexedFive);
+    }
+  }
 #else
   (void)program;
   (void)binding;

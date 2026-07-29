@@ -417,8 +417,14 @@ void screenshot(const char* path) noexcept {
   if (w == 0 || h == 0) {
     return;
   }
+#ifdef AURORA_GLES2
+  // GLES2 has only GL_FRAMEBUFFER and no glReadBuffer entry point. Reading
+  // pixels from the bound default framebuffer already selects its back buffer.
+  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+#else
   gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, 0);
   gl::gl.ReadBuffer(gl::GL_BACK);
+#endif
   gl::gl.PixelStorei(gl::GL_PACK_ALIGNMENT, 1);
   std::vector<uint8_t> pixels(static_cast<size_t>(w) * h * 4);
   gl::gl.ReadPixels(0, 0, static_cast<gl::GLsizei>(w), static_cast<gl::GLsizei>(h), gl::GL_RGBA, gl::GL_UNSIGNED_BYTE,

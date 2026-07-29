@@ -48,7 +48,16 @@ namespace aurora::gx {
 constexpr bool EnableNormalVisualization = false;
 constexpr bool EnableDebugPrints = false;
 constexpr bool UsePerPixelLighting = false;
+// GX clip-space depth occupies [-w, 0] and must be remapped by the generated
+// shader either way.  Old Mali-450 GLES2 rejects the D24 reversed-Z
+// clear-to-zero/GEQUAL path during Pikmin's cinematic passes, leaving an
+// otherwise valid frame completely depth-culled.  D24 gains no precision from
+// reversed-Z, so keep forward-Z on this compatibility backend only.
+#ifdef AURORA_GLES2
+constexpr bool UseReversedZ = false;
+#else
 constexpr bool UseReversedZ = true;
+#endif
 
 constexpr u32 MaxTextures = GX_MAX_TEXMAP;
 constexpr u32 MaxTluts = 20;
