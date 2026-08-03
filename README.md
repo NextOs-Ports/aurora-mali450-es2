@@ -3,6 +3,16 @@
 </div>
 <br/>
 
+> [!NOTE]
+> **This is the NextOS fork of Aurora**, maintained by the NextOS Elite project. It adds the
+> OpenGL ES 2.0 backend for Mali-450 (Utgard), extending the GLES/GLES3 backend by Brian
+> Degenhardt (bmdhacks). Aurora itself is by Luke Street (`encounter`) and the AxioDL
+> contributors — all upstream credit and links below are theirs and unchanged.
+>
+> Help with **this fork**: 💬 [NextOS Discord](https://discord.gg/DHfY62eDNN).
+> To support the NextOS porting work: [GitHub Sponsors](https://github.com/sponsors/NextOs-Ports) ·
+> [Ko-fi](https://ko-fi.com/nextos) · [PIX](https://livepix.gg/nextos).
+
 Aurora is a source-level GameCube & Wii compatibility layer intended for use with game decompilation projects.
 
 Originally developed for use in [Metaforce](https://github.com/AxioDL/metaforce), a Metroid Prime reverse engineering project.
